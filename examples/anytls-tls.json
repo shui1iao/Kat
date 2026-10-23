@@ -1,0 +1,5 @@
+{
+  "inbounds":[{"protocol":"anytls","listen":"127.0.0.1:10815","anytls":{"password":"replace-with-high-entropy-secret","max_sessions":8,"max_streams":16,"session_streams":8,"stream_bytes":131072,"session_bytes":1048576,"slow_timeout":"10s"},"tls":{"cert":"server.crt","key":"server.key"}}],
+  "udp_bind_ipv4":"127.0.0.1","udp_bind_ipv6":"::1",
+  "limits":{"connections":32,"logical_streams":32,"handshakes":8,"dials":8,"udp_associations":8,"udp_queue":4,"udp_queue_bytes":262028,"udp_targets":16,"pool_buffers":16,"tcp_idle":"5m","drain_timeout":"5s","udp_idle":"60s"}
+}

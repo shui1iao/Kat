@@ -1,0 +1,383 @@
+package kernel
+
+import (
+	"bytes"
+	"crypto/tls"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	A "github.com/shui1iao/Kat/internal/anytls"
+	"github.com/shui1iao/Kat/internal/snell"
+	VX "github.com/shui1iao/Kat/internal/vlessx"
+	VT "github.com/shui1iao/Kat/internal/vtransport"
+	XH "github.com/shui1iao/Kat/internal/xhttp"
+	"io"
+	"net"
+	"os"
+	"time"
+)
+
+type Duration time.Duration
+
+func (d *Duration) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err != nil {
+		return errors.New("duration must be a string")
+	}
+	v, e := time.ParseDuration(s)
+	if e != nil {
+		return errors.New("invalid duration")
+	}
+	*d = Duration(v)
+	return nil
+}
+func (d Duration) value() time.Duration { return time.Duration(d) }
+
+type User struct {
+	Flow     string `json:"flow,omitempty"`
+	Username string `json:"username,omitempty"`
+	Password string `json:"password,omitempty"`
+	UUID     string `json:"uuid,omitempty"`
+}
+type TLSConfig struct {
+	Cert string `json:"cert"`
+	Key  string `json:"key"`
+}
+type Inbound struct {
+	xhttpServer   *XH.Server
+	Transport     *VTransportOptions `json:"transport,omitempty"`
+	Reality       *RealityOptions    `json:"reality,omitempty"`
+	realityServer *VX.RealityServer
+	AnyTLS        *AnyTLSOptions `json:"anytls,omitempty"`
+	anytlsServer  *A.Server
+	Protocol      string        `json:"protocol"`
+	Listen        string        `json:"listen"`
+	Users         []User        `json:"users,omitempty"`
+	TLS           *TLSConfig    `json:"tls,omitempty"`
+	AllowInsecure bool          `json:"allow_insecure,omitempty"`
+	SS            *SSOptions    `json:"ss,omitempty"`
+	Snell         *SnellOptions `json:"snell,omitempty"`
+	ssRuntime     *ssRuntime
+	snellServer   *snell.Server
+	tlsConfig     *tls.Config
+}
+type Limits struct {
+	LogicalStreams   int      `json:"logical_streams"`
+	Connections      int      `json:"connections"`
+	Handshakes       int      `json:"handshakes"`
+	Dials            int      `json:"dials"`
+	UDPAssociations  int      `json:"udp_associations"`
+	UDPQueueBytes    int      `json:"udp_queue_bytes"`
+	UDPQueue         int      `json:"udp_queue"`
+	UDPTargets       int      `json:"udp_targets"`
+	BufferSize       int      `json:"buffer_size"`
+	PoolBuffers      int      `json:"pool_buffers"`
+	HandshakeTimeout Duration `json:"handshake_timeout"`
+	DialTimeout      Duration `json:"dial_timeout"`
+	DrainTimeout     Duration `json:"drain_timeout"`
+	TCPIdle          Duration `json:"tcp_idle"`
+	UDPIdle          Duration `json:"udp_idle"`
+	DisableFastPath  bool     `json:"disable_fast_path"`
+}
+type Config struct {
+	UDPBindIPv4 string    `json:"udp_bind_ipv4,omitempty"`
+	UDPBindIPv6 string    `json:"udp_bind_ipv6,omitempty"`
+	Inbounds    []Inbound `json:"inbounds"`
+	Limits      Limits    `json:"limits"`
+}
+
+func Load(path string) (Config, error) {
+	var c Config
+	f, e := os.Open(path)
+	if e != nil {
+		return c, errors.New("cannot open configuration")
+	}
+	defer f.Close()
+	b, e := io.ReadAll(io.LimitReader(f, 1<<20+1))
+	if e != nil || len(b) > 1<<20 {
+		return c, errors.New("configuration exceeds 1 MiB or cannot be read")
+	}
+	d := json.NewDecoder(bytes.NewReader(b))
+	d.DisallowUnknownFields()
+	if e = d.Decode(&c); e != nil {
+		return c, errors.New("invalid configuration JSON or unknown field")
+	}
+	if e = d.Decode(new(any)); e != io.EOF {
+		return c, errors.New("trailing configuration data")
+	}
+	return c, c.Validate()
+}
+func (c *Config) Validate() error {
+	for _, b := range []struct {
+		value string
+		v4    bool
+	}{{c.UDPBindIPv4, true}, {c.UDPBindIPv6, false}} {
+		if b.value != "" {
+			ip := net.ParseIP(b.value)
+			if ip == nil || (ip.To4() != nil) != b.v4 {
+				return errors.New("invalid UDP bind address family")
+			}
+		}
+	}
+	l := &c.Limits
+	def := func(p *int, v int) {
+		if *p == 0 {
+			*p = v
+		}
+	}
+	def(&l.Connections, 1024)
+	def(&l.LogicalStreams, 256)
+	def(&l.Handshakes, 64)
+	def(&l.Dials, 64)
+	def(&l.UDPAssociations, 128)
+	def(&l.UDPQueue, 16)
+	def(&l.UDPQueueBytes, l.UDPQueue*maxDatagram)
+	def(&l.UDPTargets, 64)
+	def(&l.BufferSize, 16384)
+	def(&l.PoolBuffers, 128)
+	dd := func(p *Duration, v time.Duration) {
+		if *p == 0 {
+			*p = Duration(v)
+		}
+	}
+	dd(&l.HandshakeTimeout, 10*time.Second)
+	dd(&l.DialTimeout, 5*time.Second)
+	dd(&l.DrainTimeout, 5*time.Second)
+	dd(&l.UDPIdle, 60*time.Second)
+
+	for _, v := range []int{l.Connections, l.LogicalStreams, l.Handshakes, l.Dials, l.UDPAssociations, l.PoolBuffers} {
+		if v < 1 || v > 65536 {
+			return errors.New("resource count must be between 1 and 65536")
+		}
+	}
+	if l.UDPQueueBytes < 1 || l.UDPQueueBytes > 256*maxDatagram {
+		return errors.New("invalid UDP queue byte budget")
+	}
+	if l.UDPQueue < 1 || l.UDPQueue > 256 || l.UDPTargets < 1 || l.UDPTargets > 1024 || l.BufferSize < 1024 || l.BufferSize > 65536 {
+		return errors.New("invalid queue, target or buffer limit")
+	}
+	for _, v := range []Duration{l.HandshakeTimeout, l.DialTimeout, l.DrainTimeout, l.UDPIdle} {
+		if v.value() < time.Millisecond || v.value() > 24*time.Hour {
+			return errors.New("timeouts must be between 1ms and 24h")
+		}
+	}
+	if l.TCPIdle < 0 || l.TCPIdle.value() > 24*time.Hour {
+		return errors.New("invalid TCP idle timeout (0 disables for non-Snell)")
+	}
+	if len(c.Inbounds) == 0 || len(c.Inbounds) > 64 {
+		return errors.New("need 1..64 inbounds")
+	}
+	for i := range c.Inbounds {
+		in := &c.Inbounds[i]
+		host, _, e := net.SplitHostPort(in.Listen)
+		if e != nil {
+			return fmt.Errorf("inbound %d: invalid listen address", i)
+		}
+		ip := net.ParseIP(host)
+		if ip == nil {
+			return fmt.Errorf("inbound %d: listen host must be a literal IP", i)
+		}
+		a, e := net.ResolveTCPAddr("tcp", in.Listen)
+		if e != nil || a.Port < 0 {
+			return fmt.Errorf("inbound %d: invalid listen port", i)
+		}
+		if len(in.Users) > 1024 {
+			return errors.New("too many users")
+		}
+		if in.Protocol != "shadowsocks" && in.SS != nil || in.Protocol != "snell" && in.Snell != nil {
+			return errors.New("protocol options do not match inbound")
+		}
+		if in.Protocol != "anytls" && in.AnyTLS != nil {
+			return errors.New("AnyTLS options do not match protocol")
+		}
+		if in.Protocol != "vless" && (in.Transport != nil || in.Reality != nil) {
+			return errors.New("VLESS-only transport/security options")
+		}
+		for _, u := range in.Users {
+			if in.Protocol != "vless" && u.Flow != "" {
+				return errors.New("flow only valid for VLESS")
+			}
+		}
+		switch in.Protocol {
+		case "anytls":
+			if in.TLS == nil || len(in.Users) != 0 {
+				return errors.New("AnyTLS requires TLS and single password options")
+			}
+			if e := in.AnyTLS.normalize(); e != nil {
+				return e
+			}
+		case "shadowsocks":
+			if in.TLS != nil || len(in.Users) != 0 {
+				return errors.New("SS uses its own encrypted transport and single identity")
+			}
+			if in.SS == nil {
+				return errors.New("SS options required")
+			}
+			if e := in.SS.validate(); e != nil {
+				return e
+			}
+		case "snell":
+			if in.TLS != nil || len(in.Users) != 0 {
+				return errors.New("Snell uses one PSK and native obfuscation only")
+			}
+			if e := in.Snell.validate(); e != nil {
+				return e
+			}
+		case "socks5":
+			if len(in.Users) == 0 && !ip.IsLoopback() {
+				return errors.New("non-loopback SOCKS5 requires users")
+			}
+			if in.TLS != nil {
+				return errors.New("SOCKS5 TLS wrapper is not implemented")
+			}
+			seen := map[string]bool{}
+			for _, u := range in.Users {
+				if len(u.Username) < 1 || len(u.Username) > 255 || len(u.Password) < 1 || len(u.Password) > 255 || u.UUID != "" || seen[u.Username] {
+					return errors.New("invalid or duplicate SOCKS5 user")
+				}
+				seen[u.Username] = true
+			}
+		case "trojan":
+			if in.TLS == nil || len(in.Users) == 0 {
+				return errors.New("Trojan requires TLS and password users")
+			}
+			seen := map[string]bool{}
+			for _, u := range in.Users {
+				if u.Password == "" || len(u.Password) > 4096 || u.Username != "" || u.UUID != "" || seen[u.Password] {
+					return errors.New("invalid or duplicate Trojan credential")
+				}
+				seen[u.Password] = true
+			}
+		case "vless":
+			if len(in.Users) == 0 {
+				return errors.New("VLESS requires UUID users")
+			}
+			if in.TLS == nil && in.Reality == nil && !ip.IsLoopback() && !in.AllowInsecure {
+				return errors.New("non-loopback plaintext VLESS requires explicit allow_insecure")
+			}
+			if in.TLS != nil && in.Reality != nil {
+				return errors.New("TLS and REALITY are mutually exclusive")
+			}
+			if in.Reality != nil {
+				if _, e := in.Reality.config(*l); e != nil {
+					return e
+				}
+			}
+			if in.Transport != nil {
+				if (in.Transport.Type == "grpc" || in.Transport.Type == "xhttp") && in.TLS == nil {
+					return errors.New("gRPC requires actual TLS/h2; h2c unsupported")
+				}
+				if in.Reality != nil {
+					return errors.New("REALITY only supports RAW in this core")
+				}
+				if in.Transport.MaxStreams == 0 {
+					in.Transport.MaxStreams = 16
+				}
+				if in.Transport.MaxStreams < 1 || in.Transport.MaxStreams > l.LogicalStreams {
+					return errors.New("invalid transport stream quota")
+				}
+				if in.Transport.Type == "xhttp" {
+					if in.Transport.MaxEarlyData != 0 || in.Transport.ServiceName != "" {
+						return errors.New("XHTTP only default placement; no WS ED/grpc service")
+					}
+					if in.Transport.XHTTP == nil {
+						in.Transport.XHTTP = &XHTTPOptions{}
+					}
+					if e := in.Transport.XHTTP.validate(in.Transport, *l); e != nil {
+						return e
+					}
+				} else if in.Transport.XHTTP != nil {
+					return errors.New("XHTTP options require xhttp type")
+				} else if _, e := VT.NewServer(in.Transport.config(*l)); e != nil {
+					return errors.New("invalid VLESS transport endpoint")
+				}
+			}
+			seen := map[[16]byte]bool{}
+			for _, u := range in.Users {
+				if u.Flow != "" && u.Flow != VX.VisionFlow {
+					return errors.New("unsupported VLESS flow")
+				}
+				if u.Flow != "" && (in.Transport != nil || (in.TLS == nil && in.Reality == nil)) {
+					return errors.New("Vision requires RAW TLS1.3 or local REALITY")
+				}
+				v, e := parseUUID(u.UUID)
+				if e != nil || u.Password != "" || u.Username != "" || seen[v] {
+					return errors.New("invalid or duplicate VLESS UUID")
+				}
+				seen[v] = true
+			}
+		default:
+			return errors.New("unsupported inbound protocol")
+		}
+		if in.TLS != nil {
+			cert, e := tls.LoadX509KeyPair(in.TLS.Cert, in.TLS.Key)
+			if e != nil {
+				return errors.New("cannot load TLS certificate/key")
+			}
+			in.tlsConfig = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+			if in.Protocol == "vless" {
+				for _, u := range in.Users {
+					if u.Flow == VX.VisionFlow {
+						in.tlsConfig.MinVersion = tls.VersionTLS13
+					}
+				}
+				if in.Transport != nil {
+					if in.Transport.Type == "xhttp" {
+						in.tlsConfig.NextProtos = []string{"h2", "http/1.1"}
+						if len(in.Transport.XHTTP.ALPN) > 0 {
+							in.tlsConfig.NextProtos = append([]string(nil), in.Transport.XHTTP.ALPN...)
+						}
+					} else if in.Transport.Type == "grpc" {
+						in.tlsConfig.NextProtos = []string{"h2"}
+					} else {
+						in.tlsConfig.NextProtos = []string{"http/1.1"}
+					}
+				}
+			}
+		}
+	}
+	seenAny := map[string]AnyTLSOptions{}
+	seenSS := map[string]SSOptions{}
+	seenSn := map[string]SnellOptions{}
+	for _, in := range c.Inbounds {
+		if in.AnyTLS != nil {
+			if old, ok := seenAny[in.AnyTLS.Password]; ok && old != *in.AnyTLS {
+				return errors.New("same AnyTLS identity has conflicting limits")
+			}
+			seenAny[in.AnyTLS.Password] = *in.AnyTLS
+		}
+		if in.SS != nil {
+			id, _ := in.SS.identity()
+			if prev, ok := seenSS[id]; ok && prev.protection() != in.SS.protection() {
+				return errors.New("same SS identity has conflicting settings")
+			}
+			seenSS[id] = *in.SS
+		}
+		if in.Snell != nil {
+			if prev, ok := seenSn[in.Snell.PSK]; ok && (prev.Obfs != in.Snell.Obfs || prev.ReplayCapacity != in.Snell.ReplayCapacity || prev.MaxRequests != in.Snell.MaxRequests) {
+				return errors.New("same Snell PSK requires same obfs/protection settings")
+			}
+			seenSn[in.Snell.PSK] = *in.Snell
+		}
+	}
+	totalAnyWorkers := 0
+	for _, o := range seenAny {
+		totalAnyWorkers += o.MaxStreams
+	}
+	if totalAnyWorkers > l.LogicalStreams {
+		return errors.New("AnyTLS identity worker budgets exceed logical_streams; allocate explicit bounded identity quotas")
+	}
+	return nil
+}
+func parseUUID(s string) (v [16]byte, e error) {
+	if len(s) != 36 || s[8] != '-' || s[13] != '-' || s[18] != '-' || s[23] != '-' {
+		return v, errors.New("UUID must be canonical")
+	}
+	b, e := hex.DecodeString(s[:8] + s[9:13] + s[14:18] + s[19:23] + s[24:])
+	if e != nil {
+		return v, errors.New("invalid UUID")
+	}
+	copy(v[:], b)
+	return v, nil
+}

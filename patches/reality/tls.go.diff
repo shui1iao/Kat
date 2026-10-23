@@ -1,0 +1,132 @@
+--- upstream-9234c772/tls.go
++++ stage-patched/tls.go
+@@ -160,6 +160,25 @@
+ // You MUST call `DetectPostHandshakeRecordsLens(config)` in advance manually
+ // if you don't use REALITY's listener, e.g., Xray-core's RAW transport.
+ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
++	if ctx == nil {
++		return nil, errors.New("REALITY: nil context")
++	}
++	// Stage safety bound includes unauthenticated fallback; the caller may set
++	// an earlier deadline. Successful connections leave this handshake context.
++	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
++	defer cancel()
++	if n, ok := conn.(interface{ CloseNotify() <-chan struct{} }); ok {
++		watchDone := make(chan struct{})
++		defer close(watchDone)
++		go func() {
++			select {
++			case <-n.CloseNotify():
++				cancel()
++			case <-watchDone:
++			case <-ctx.Done():
++			}
++		}()
++	}
+ 	remoteAddr := conn.RemoteAddr().String()
+ 	if config.Show {
+ 		fmt.Printf("REALITY remoteAddr: %v\n", remoteAddr)
+@@ -171,6 +190,13 @@
+ 		return nil, errors.New("REALITY: failed to dial dest: " + err.Error())
+ 	}
+ 
++	stopIO := context.AfterFunc(ctx, func() { conn.Close(); target.Close() })
++	defer stopIO()
++	if err := ctx.Err(); err != nil {
++		target.Close()
++		conn.Close()
++		return nil, err
++	}
+ 	if config.Xver == 1 || config.Xver == 2 {
+ 		if _, err = proxyproto.HeaderProxyFromAddrs(config.Xver, conn.RemoteAddr(), conn.LocalAddr()).WriteTo(target); err != nil {
+ 			target.Close()
+@@ -189,6 +215,9 @@
+ 
+ 	hs := serverHandshakeStateTLS13{
+ 		c: &Conn{
++			// Initialize the standard TLS control-record budget independently of
++			// an optional compatibility CCS having triggered retryReadRecord.
++			MaxUselessRecords: maxUselessRecords,
+ 			conn: &MirrorConn{
+ 				Mutex:  mutex,
+ 				Conn:   conn,
+@@ -196,7 +225,7 @@
+ 			},
+ 			config: config,
+ 		},
+-		ctx: context.Background(),
++		ctx: ctx,
+ 	}
+ 
+ 	copying := false
+@@ -207,7 +236,7 @@
+ 	go func() {
+ 		for {
+ 			mutex.Lock()
+-			hs.clientHello, _, err = hs.c.readClientHello(context.Background()) // TODO: Change some rules in this function.
++			hs.clientHello, _, err = hs.c.readClientHello(ctx) // TODO: Change some rules in this function.
+ 			if copying || err != nil || hs.c.vers != VersionTLS13 || !config.ServerNames[hs.clientHello.serverName] {
+ 				break
+ 			}
+@@ -401,9 +430,22 @@
+ 				} else {
+ 					key += " 1"
+ 				}
+-				if val, ok := GlobalPostHandshakeRecordsLens.Load(key); ok {
++				var val any
++				var ok bool
++				if config.PostHandshakeProfiles != nil {
++					val, ok = config.PostHandshakeProfiles[key]
++				} else {
++					val, ok = GlobalPostHandshakeRecordsLens.Load(key)
++				}
++				if ok {
+ 					if postHandshakeRecordsLens, ok := val.([]int); ok {
++						if len(postHandshakeRecordsLens) > 32 {
++							break f
++						}
+ 						for _, length := range postHandshakeRecordsLens {
++							if length < 22 || length > 18437 {
++								break f
++							}
+ 							plainText := make([]byte, length-16)
+ 							plainText[0] = 23
+ 							plainText[1] = 3
+@@ -421,11 +463,18 @@
+ 						break
+ 					}
+ 				}
+-				time.Sleep(5 * time.Second)
++				select {
++				case <-ctx.Done():
++					break f
++				case <-time.After(10 * time.Millisecond):
++				}
+ 				if maxUseless, ok := GlobalMaxCSSMsgCount.Load(key); ok {
+ 					hs.c.MaxUselessRecords = maxUseless.(int)
+ 				}
+ 			}
++			if ctx.Err() != nil {
++				break f
++			}
+ 			hs.c.isHandshakeComplete.Store(true)
+ 			break
+ 		}
+@@ -453,6 +502,17 @@
+ 	if config.Show {
+ 		fmt.Printf("REALITY remoteAddr: %v\ths.c.isHandshakeComplete.Load(): %v\n", remoteAddr, hs.c.isHandshakeComplete.Load())
+ 	}
++	if ctx.Err() != nil {
++		conn.Close()
++		return nil, ctx.Err()
++	}
++	if n, ok := conn.(interface{ CloseNotify() <-chan struct{} }); ok {
++		select {
++		case <-n.CloseNotify():
++			return nil, net.ErrClosed
++		default:
++		}
++	}
+ 	if hs.c.isHandshakeComplete.Load() {
+ 		return hs.c, nil
+ 	}

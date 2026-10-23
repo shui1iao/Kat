@@ -1,0 +1,20 @@
+--- upstream-9234c772/common.go
++++ stage-patched/common.go
+@@ -548,6 +548,9 @@
+ // modified. A Config may be reused; the tls package will also not
+ // modify it.
+ type Config struct {
++	// Local bounded preflight results, immutable after initialization.
++	PostHandshakeProfiles map[string][]int
++
+ 	DialContext func(ctx context.Context, network, address string) (net.Conn, error)
+ 
+ 	Show bool
+@@ -970,6 +973,7 @@
+ 	c.mutex.RLock()
+ 	defer c.mutex.RUnlock()
+ 	return &Config{
++		PostHandshakeProfiles:               c.PostHandshakeProfiles,
+ 		DialContext:                         c.DialContext,
+ 		Show:                                c.Show,
+ 		Type:                                c.Type,
