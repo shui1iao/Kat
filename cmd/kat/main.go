@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-const version = "0.5.20"
+const version = "0.6.0"
 
 func execute(args []string) error {
 	if len(args) == 1 && args[0] == "version" {
@@ -24,7 +24,7 @@ func execute(args []string) error {
 	}
 	c, e := kernel.Load(args[1])
 	if e != nil {
-		return e
+		return fmt.Errorf("configuration_rejected")
 	}
 	if args[0] == "check" {
 		fmt.Println("configuration valid")
@@ -32,20 +32,23 @@ func execute(args []string) error {
 	}
 	s, e := kernel.Start(c)
 	if e != nil {
-		return e
+		return fmt.Errorf("startup_failed")
 	}
 	for _, a := range s.Addresses() {
-		fmt.Fprintln(os.Stderr, "listening", a)
+		kernel.WriteDiagnosticLine(fmt.Sprintln("listening", a))
 	}
 	for _, b := range s.SSUDPReceiveBuffers() {
-		fmt.Fprintf(os.Stderr, "ss2017 udp_rcvbuf %s default=%d actual=%d charged=%d\n", b.Address, b.Default, b.Actual, b.Charged)
+		kernel.WriteDiagnosticLine(fmt.Sprintf("ss2017 udp_rcvbuf %s default=%d actual=%d charged=%d\n", b.Address, b.Default, b.Actual, b.Charged))
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	<-ctx.Done()
 	drain, cancel := context.WithTimeout(context.Background(), time.Duration(c.Limits.DrainTimeout))
 	defer cancel()
-	_ = s.Close(drain)
+	if e := s.Close(drain); e != nil {
+		kernel.WriteDiagnosticLine("kat event=shutdown reason=drain_deadline\n")
+	}
+	kernel.WriteDiagnosticLine("kat event=stopped\n")
 	if os.Getenv("KAT_TEST_DIAGNOSTICS") == "1" {
 		local := true
 		for _, in := range c.Inbounds {
@@ -55,14 +58,15 @@ func execute(args []string) error {
 			}
 		}
 		if local {
-			_ = json.NewEncoder(os.Stderr).Encode(s.Diagnostics())
+			b, _ := json.Marshal(s.Diagnostics())
+			kernel.WriteDiagnosticLine(string(b) + "\n")
 		}
 	}
 	return nil
 }
 func main() {
 	if e := execute(os.Args[1:]); e != nil {
-		fmt.Fprintln(os.Stderr, "error:", e)
+		kernel.WriteDiagnosticLine("kat event=exit reason=" + e.Error() + "\n")
 		os.Exit(1)
 	}
 }

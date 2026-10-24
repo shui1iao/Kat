@@ -1,0 +1,6 @@
+# Kat 规则集示例：domain 格式，每行一个域名。
+# 不带前缀为精确匹配；以 "." 或 "+." 开头表示匹配该域名本身及其所有子域名。
+# 以 #、; 或 // 开头的行是注释。示例域名均为保留的示例域名。
+ads.example
+.tracker.example
++.telemetry.example

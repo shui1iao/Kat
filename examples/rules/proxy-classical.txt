@@ -1,0 +1,9 @@
+# Kat 规则集示例：classical 格式（Surge / mihomo 常见行的子集）。
+# 支持 DOMAIN、DOMAIN-SUFFIX、DOMAIN-KEYWORD、IP-CIDR、IP-CIDR6、GEOIP、DST-PORT；
+# 可附加 no-resolve。其他类型的行会被跳过并计数，不会导致整份规则集失败。
+DOMAIN,www.example.org
+DOMAIN-SUFFIX,example.com
+DOMAIN-KEYWORD,example-video
+IP-CIDR,198.51.100.0/24,no-resolve
+IP-CIDR6,2001:db8::/32,no-resolve
+DST-PORT,8443

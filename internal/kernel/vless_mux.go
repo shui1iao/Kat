@@ -67,7 +67,7 @@ func (s *Server) serveMux(parent context.Context, c net.Conn, uuid [16]byte) err
 				continue
 			}
 			child, stop := context.WithCancel(ctx)
-			a := &udpAssociation{server: s, ctx: child, cancel: stop, queue: make(chan packet, s.cfg.Limits.UDPQueue), allowed: map[netip.AddrPort]time.Time{}}
+			a := &udpAssociation{server: s, ctx: child, cancel: stop, queue: make(chan packet, s.cfg.Limits.UDPQueue), allowed: map[netip.AddrPort]time.Time{}, source: sourceOf(parent)}
 			if e = a.openOutbound(); e != nil {
 				stop()
 				<-s.udpSlots

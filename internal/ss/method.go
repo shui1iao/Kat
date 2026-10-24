@@ -89,7 +89,11 @@ type Config struct {
 	UserID         string
 	MaxTCPSalts    int // SIP022 incoming salts, default 65536.
 	MaxUDPSessions int // SIP022 sessions, default 4096.
-	Max2017Salts   int // Incoming TCP/UDP and outgoing salts; default32M, process table budget2GiB.
+	// UDPIdle is the SIP022 session inactivity lifetime, not packet timestamp tolerance.
+	// Zero preserves the standalone codec default (61s); live state is retained
+	// for at least replayTTL even when an association has a shorter idle.
+	UDPIdle      time.Duration
+	Max2017Salts int // Incoming TCP/UDP and outgoing salts; default32M, process table budget2GiB.
 }
 
 type Server struct {
@@ -132,6 +136,12 @@ func NewServer(c Config) (*Server, error) {
 	s.tcpSalts.init(c.MaxTCPSalts)
 	s.oldSalts.init(c.Max2017Salts)
 	s.udp.init(c.MaxUDPSessions)
+	if c.UDPIdle < 0 || c.UDPIdle > 24*time.Hour {
+		return nil, errors.New("ss: invalid UDP idle")
+	}
+	if c.UDPIdle > s.udp.idle {
+		s.udp.idle = c.UDPIdle
+	}
 	if m.v2022 {
 		if m.chacha {
 			if s.udpX, err = chacha20poly1305.NewX(s.key); err != nil {

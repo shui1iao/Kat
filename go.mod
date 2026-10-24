@@ -3,6 +3,7 @@ module github.com/shui1iao/Kat
 go 1.26.9
 
 require (
+	github.com/oschwald/maxminddb-golang v1.13.1
 	golang.org/x/crypto v0.57.0
 	lukechampine.com/blake3 v1.4.1
 )

@@ -23,8 +23,9 @@ type ssRuntime struct {
 	associations map[ssAssociationID]*ssNativeAssociation
 }
 type ssUDPListener struct {
-	socket  *net.UDPConn
-	runtime *ssRuntime
+	logIndex int
+	socket   *net.UDPConn
+	runtime  *ssRuntime
 	// Explicit udp_rcvbuf_2017 only: read-back sizes and the bytes still charged
 	// to the process extra socket budget (released exactly once, after close).
 	rcvbufBefore, rcvbufActual int
@@ -36,25 +37,34 @@ type ssUDPListener struct {
 func (l *ssUDPListener) releaseRcvBuf() { returnSSRcvBuf(l.rcvbufCharge.Swap(0)) }
 
 type ssNativeAssociation struct {
-	a            *udpAssociation
-	runtime      *ssRuntime
-	id           ssAssociationID
-	capability   *ss.Packet
-	listener     *ssUDPListener
-	lastReceived time.Time // independent of response activity; epoch must expire before codec TTL
+	a          *udpAssociation
+	runtime    *ssRuntime
+	id         ssAssociationID
+	capability *ss.Packet
+	listener   *ssUDPListener
 }
 
 func (s *Server) listenSSUDP(in Inbound, bound net.Addr) (*ssUDPListener, error) {
 	a := bound.(*net.TCPAddr)
-	network := "udp6"
-	if a.IP.To4() != nil {
-		network = "udp4"
-	}
-	u, e := net.ListenUDP(network, &net.UDPAddr{IP: a.IP, Port: a.Port, Zone: a.Zone})
+	// TCP wildcard selection may be dual-stack [::] for an IPv4 config.
+	// Preserve the configured UDP family, but use TCP's actual port (also :0).
+	host, _, e := net.SplitHostPort(in.Listen)
 	if e != nil {
 		return nil, e
 	}
-	l := &ssUDPListener{socket: u, runtime: in.ssRuntime}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return nil, errors.New("invalid SS UDP listen IP")
+	}
+	network := "udp6"
+	if ip.To4() != nil {
+		network = "udp4"
+	}
+	u, e := net.ListenUDP(network, &net.UDPAddr{IP: ip, Port: a.Port, Zone: a.Zone})
+	if e != nil {
+		return nil, e
+	}
+	l := &ssUDPListener{socket: u, runtime: in.ssRuntime, logIndex: in.logIndex}
 	if in.SS != nil && in.SS.UDPRcvBuf2017 != 0 {
 		if in.ssRuntime.v2022 {
 			u.Close()
@@ -100,11 +110,19 @@ func (s *Server) readSSUDP(l *ssUDPListener) {
 	for {
 		n, source, e := l.socket.ReadFromUDPAddrPort(wire)
 		if e != nil {
+			if !quietFailure(e) {
+				s.failure(failUDPIO, "shadowsocks", l.logIndex)
+			}
 			return
 		}
 		source = netip.AddrPortFrom(source.Addr().Unmap(), source.Port())
 		if n > maxDatagram || !acquire(s.handSlots) {
 			s.counters.Dropped.Add(1)
+			if n > maxDatagram {
+				s.failure(failUDPInvalid, "shadowsocks", l.logIndex)
+			} else {
+				s.failure(failUDPBudget, "shadowsocks", l.logIndex)
+			}
 			continue
 		}
 		rt := l.runtime
@@ -119,6 +137,7 @@ func (s *Server) readSSUDP(l *ssUDPListener) {
 		<-s.handSlots
 		if e != nil {
 			s.counters.Dropped.Add(1)
+			s.failure(failUDPInvalid, "shadowsocks", l.logIndex)
 			continue
 		}
 		rt.mu.Lock()
@@ -132,7 +151,7 @@ func (s *Server) readSSUDP(l *ssUDPListener) {
 			id = ssAssociationID{session: p.ClientSessionID}
 		}
 		assoc := rt.associations[id]
-		if assoc != nil && (assoc.a.ctx.Err() != nil || rt.v2022 && time.Since(assoc.lastReceived) >= 60*time.Second) {
+		if assoc != nil && (assoc.a.ctx.Err() != nil || assoc.a.ssIdleExpired(time.Now())) {
 			assoc.a.cancel()
 			delete(rt.associations, id)
 			assoc = nil
@@ -141,17 +160,20 @@ func (s *Server) readSSUDP(l *ssUDPListener) {
 			if !acquire(s.udpSlots) {
 				rt.mu.Unlock()
 				s.counters.Dropped.Add(1)
+				s.failure(failUDPBudget, "shadowsocks", l.logIndex)
 				continue
 			}
 			ctx, cancel := context.WithCancel(s.nativeContext)
-			a := &udpAssociation{server: s, ctx: ctx, cancel: cancel, queue: make(chan packet, s.cfg.Limits.UDPQueue), allowed: map[netip.AddrPort]time.Time{}}
+			a := &udpAssociation{server: s, ctx: ctx, cancel: cancel, ssNative: true, queue: make(chan packet, s.cfg.Limits.UDPQueue), allowed: map[netip.AddrPort]time.Time{}, source: source.Addr()}
 			if e = a.openOutbound(); e != nil {
 				cancel()
 				<-s.udpSlots
 				rt.mu.Unlock()
 				s.counters.Dropped.Add(1)
+				s.failure(failUDPIO, "shadowsocks", l.logIndex)
 				continue
 			}
+			a.activity.Store(p.AuthenticatedAt().UnixNano())
 			assoc = &ssNativeAssociation{a: a, runtime: rt, id: id}
 			a.writeBack = assoc.reply
 			rt.associations[id] = assoc
@@ -161,7 +183,8 @@ func (s *Server) readSSUDP(l *ssUDPListener) {
 		}
 		assoc.capability = p
 		assoc.listener = l
-		assoc.lastReceived = time.Now()
+		// Only a fully authenticated, fresh, formatted request reaches here.
+		assoc.a.touchSSActivity(p.AuthenticatedAt())
 		assoc.a.enqueue(packet{Address{p.Target.Host, p.Target.Port}, p.Payload})
 		rt.mu.Unlock()
 	}
@@ -218,7 +241,8 @@ func (s *Server) runSSAssociation(n *ssNativeAssociation) {
 			go func() { defer a.wg.Done(); defer a.cancel(); a.returnLoop(socket) }()
 		}
 	}
-	// Peer keepalive cannot indefinitely retain an old capability after codec epoch expiry.
+	// The association and codec use configured bidirectional inactivity, not
+	// the timestamp/replay retention interval. Return readers also enforce idle.
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
@@ -227,9 +251,7 @@ func (s *Server) runSSAssociation(n *ssNativeAssociation) {
 			a.wg.Wait()
 			return
 		case <-ticker.C:
-			n.runtime.mu.Lock()
-			expired := n.runtime.v2022 && time.Since(n.lastReceived) >= 60*time.Second
-			n.runtime.mu.Unlock()
+			expired := a.ssIdleExpired(time.Now())
 			if expired {
 				a.cancel()
 			}

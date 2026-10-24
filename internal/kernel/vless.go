@@ -134,6 +134,7 @@ func acceptVLESSRawTransport(ctx context.Context, raw net.Conn, in Inbound) (net
 }
 
 func (s *Server) vlessRequest(ctx context.Context, c net.Conn, tr *VX.Transport, in Inbound, release func(), fullClose bool) error {
+	ctx = withSource(ctx, c.RemoteAddr()) // src_ip_cidr routing only
 	released := false
 	doneHand := func() {
 		if !released {

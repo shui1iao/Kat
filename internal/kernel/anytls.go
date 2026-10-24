@@ -90,9 +90,10 @@ func (c *anyStream) SetReadDeadline(t time.Time) error  { return c.st.SetReadDea
 func (c *anyStream) SetWriteDeadline(t time.Time) error { return c.st.SetWriteDeadline(t) }
 
 // FIN is whole-stream close. Do not offer a fabricated half-close capability.
-func (s *Server) serveAnyTLS(c net.Conn, in Inbound) {
-	_ = in.anytlsServer.Serve(s.ctx, c, func(ctx context.Context, st *A.Stream, r A.Request) {
+func (s *Server) serveAnyTLS(parent context.Context, c net.Conn, in Inbound) {
+	e := in.anytlsServer.Serve(parent, c, func(ctx context.Context, st *A.Stream, r A.Request) {
 		if !acquire(s.logicalSlots) {
+			s.failure(failAnyBudget, in.Protocol, in.logIndex)
 			s.counters.Rejected.Add(1)
 			st.Close()
 			return
@@ -118,7 +119,9 @@ func (s *Server) serveAnyTLS(c net.Conn, in Inbound) {
 				}
 				return udp.WritePacket(from, b)
 			}}
-			_ = s.serveUDP(stream, q)
+			if e := s.serveUDP(stream, q); !quietFailure(e) {
+				s.failure(failUDPIO, in.Protocol, in.logIndex)
+			}
 			return
 		}
 		out, e := s.dial(ctx, Address{r.Target.Host, r.Target.Port})
@@ -128,6 +131,9 @@ func (s *Server) serveAnyTLS(c net.Conn, in Inbound) {
 		defer out.Close()
 		s.relayAnyTLS(ctx, stream, out)
 	})
+	if k, ok := anyTLSFailure(e); ok {
+		s.failure(k, in.Protocol, in.logIndex)
+	}
 }
 
 // Session FIN cancels its stream, so stop both directions on EOF rather than
@@ -154,7 +160,10 @@ func (s *Server) relayAnyTLS(ctx context.Context, stream, out net.Conn) {
 			<-done
 			<-done
 			return
-		case <-done:
+		case e := <-done:
+			if !quietFailure(e) && !errors.Is(e, A.ErrStreamClosed) {
+				s.failure(failTCPIO, "anytls", -1)
+			}
 			stream.Close()
 			out.Close()
 			<-done

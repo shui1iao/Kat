@@ -137,12 +137,14 @@ type sessionStore struct {
 	serverIDs map[uint64]bool
 	queue     sessionHeap
 	capacity  int
+	idle      time.Duration
 }
 
 func (c *sessionStore) init(n int) {
 	c.entries = make(map[uint64]*udpSession)
 	c.serverIDs = make(map[uint64]bool)
 	c.capacity = n
+	c.idle = replayTTL
 }
 func (c *sessionStore) expire(now time.Time) {
 	for len(c.queue) > 0 && !c.queue[0].expires.After(now) {
@@ -152,6 +154,6 @@ func (c *sessionStore) expire(now time.Time) {
 	}
 }
 func (c *sessionStore) touch(s *udpSession, now time.Time) {
-	s.expires = now.Add(replayTTL)
+	s.expires = now.Add(c.idle)
 	heap.Fix(&c.queue, s.index)
 }

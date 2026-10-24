@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"net/netip"
+	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
 )
@@ -24,7 +25,11 @@ type Packet struct {
 	owner           *Server
 	session         *udpSession
 	source          netip.AddrPort
+	receivedAt      time.Time
 }
+
+// AuthenticatedAt is the validated receive time, not the untrusted wire timestamp.
+func (p *Packet) AuthenticatedAt() time.Time { return p.receivedAt }
 
 // DecodeUDP authenticates, validates headers/time/address, then atomically checks
 // and updates the replay window and last authenticated peer. Failed validation
@@ -142,7 +147,7 @@ func (s *Server) DecodeUDP(wire []byte, source netip.AddrPort) (*Packet, error) 
 		}
 		session.window.accept(packetID)
 		session.peer = source
-		session.expires = now.Add(replayTTL)
+		session.expires = now.Add(s.udp.idle)
 		s.udp.entries[clientID] = session
 		s.udp.serverIDs[session.serverID] = true
 		heap.Push(&s.udp.queue, session)
@@ -153,7 +158,7 @@ func (s *Server) DecodeUDP(wire []byte, source netip.AddrPort) (*Packet, error) 
 		session.peer = source
 		s.udp.touch(session, now)
 	}
-	return &Packet{Target: target, Payload: payload, UserID: s.user, ClientSessionID: clientID, PacketID: packetID, owner: s, session: session, source: source}, nil
+	return &Packet{Target: target, Payload: payload, UserID: s.user, ClientSessionID: clientID, PacketID: packetID, owner: s, session: session, source: source, receivedAt: now}, nil
 }
 
 func (s *Server) decode2017(wire []byte, source netip.AddrPort) (*Packet, error) {
@@ -175,12 +180,13 @@ func (s *Server) decode2017(wire []byte, source netip.AddrPort) (*Packet, error)
 		return nil, fmt.Errorf("%w: UDP address", ErrFormat)
 	}
 	s.mu.Lock()
-	err = s.oldSalts.admit(salt, s.now())
+	now := s.now()
+	err = s.oldSalts.admit(salt, now)
 	s.mu.Unlock()
 	if err != nil {
 		return nil, err
 	}
-	return &Packet{Target: target, Payload: plain[n:], UserID: s.user, owner: s, source: source}, nil
+	return &Packet{Target: target, Payload: plain[n:], UserID: s.user, owner: s, source: source, receivedAt: now}, nil
 }
 
 // EncodeUDP makes a server-to-client response with a source address (from) and
@@ -265,7 +271,10 @@ func (s *Server) EncodeUDP(request *Packet, from Address, payload []byte) (wire 
 		session.nextPacket++
 	}
 	clientID, responseAEAD := session.clientID, session.responseAEAD
-	// Outgoing traffic does not extend authenticated incoming session lifetime.
+	// Only the owning relay may present this capability after its exact-target
+	// authorization check. A valid response is activity too; packet timestamps
+	// and replay-window validation on incoming packets remain independent.
+	s.udp.touch(session, now)
 	peer = session.peer
 	s.mu.Unlock()
 	// One exact owned wire; AEAD seals the body in place (exact overlap).

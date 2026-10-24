@@ -75,7 +75,7 @@ func (s *Server) handleSnell(raw net.Conn, in Inbound, releaseHand func()) {
 			_ = s.serveUDP(raw, r)
 			return
 		}
-		out, e := s.dial(s.ctx, Address{q.Target.Host, q.Target.Port})
+		out, e := s.dial(withSource(s.ctx, raw.RemoteAddr()), Address{q.Target.Host, q.Target.Port})
 		if e != nil {
 			_ = q.Reject(1, "destination unavailable")
 			return

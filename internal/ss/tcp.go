@@ -113,7 +113,14 @@ func (r *recordReader) Read(p []byte) (int, error) {
 // rejection policy (e.g. TCP SO_LINGER=0 reset, or SHUT_WR then bounded drain),
 // including for short SIP022 initial reads. Blind Close with unread bytes may
 // reveal a length oracle. Deadlines and non-TCP rejection are transport policy.
-type HandshakeError struct{ Cause error }
+type HandshakeError struct {
+	Cause    error
+	emptyEOF bool
+}
+
+// EmptyEOF reports only a zero-byte EOF during the initial Read. Authentication
+// and SIP022 first-read rejection remain unchanged. Used for quiet diagnostics.
+func (e *HandshakeError) EmptyEOF() bool { return e.emptyEOF }
 
 func (e *HandshakeError) Error() string { return "ss: handshake: " + e.Cause.Error() }
 func (e *HandshakeError) Unwrap() error { return e.Cause }
@@ -173,9 +180,10 @@ func (c *TCPConn) CloseWrite() error {
 // required by SIP022 section 3.1.4. Later headers/records support fragmentation.
 // No reader buffer survives by aliasing a caller-owned packet slice.
 func (s *Server) Accept(rwc io.ReadWriteCloser) (conn *TCPConn, err error) {
+	emptyEOF := false
 	defer func() {
 		if err != nil {
-			err = &HandshakeError{err}
+			err = &HandshakeError{Cause: err, emptyEOF: emptyEOF}
 		}
 	}()
 	if rwc == nil {
@@ -190,6 +198,7 @@ func (s *Server) Accept(rwc io.ReadWriteCloser) (conn *TCPConn, err error) {
 	if s.m.v2022 {
 		initial := make([]byte, s.m.keySize+11+16)
 		n, e := rwc.Read(initial)
+		emptyEOF = n == 0 && e == io.EOF
 		if n != len(initial) {
 			return nil, fmt.Errorf("%w: got %d of %d bytes", ErrInitialRead, n, len(initial))
 		}

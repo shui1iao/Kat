@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	A "github.com/shui1iao/Kat/internal/anytls"
+	"github.com/shui1iao/Kat/internal/route"
 	"github.com/shui1iao/Kat/internal/snell"
 	VX "github.com/shui1iao/Kat/internal/vlessx"
 	VT "github.com/shui1iao/Kat/internal/vtransport"
@@ -45,6 +46,7 @@ type TLSConfig struct {
 	Key  string `json:"key"`
 }
 type Inbound struct {
+	logIndex      int
 	xhttpServer   *XH.Server
 	Transport     *VTransportOptions `json:"transport,omitempty"`
 	Reality       *RealityOptions    `json:"reality,omitempty"`
@@ -81,10 +83,19 @@ type Limits struct {
 	DisableFastPath  bool     `json:"disable_fast_path"`
 }
 type Config struct {
-	UDPBindIPv4 string    `json:"udp_bind_ipv4,omitempty"`
-	UDPBindIPv6 string    `json:"udp_bind_ipv6,omitempty"`
-	Inbounds    []Inbound `json:"inbounds"`
-	Limits      Limits    `json:"limits"`
+	DNS         *DNSOptions     `json:"dns,omitempty"`
+	Routing     *RoutingOptions `json:"routing,omitempty"`
+	UDPBindIPv4 string          `json:"udp_bind_ipv4,omitempty"`
+	UDPBindIPv6 string          `json:"udp_bind_ipv6,omitempty"`
+	Inbounds    []Inbound       `json:"inbounds"`
+	Limits      Limits          `json:"limits"`
+
+	// Routing core (all optional; absent = system DNS + direct as before).
+	Outbounds []OutboundConfig `json:"outbounds,omitempty"`
+	Groups    []GroupConfig    `json:"groups,omitempty"`
+	RuleSets  []RuleSetConfig  `json:"rule_sets,omitempty"`
+	GeoIP     *GeoIPConfig     `json:"geoip,omitempty"`
+	route     route.Options    // normalized by Validate
 }
 
 func Load(path string) (Config, error) {
@@ -109,6 +120,12 @@ func Load(path string) (Config, error) {
 	return c, c.Validate()
 }
 func (c *Config) Validate() error {
+	if e := c.validateNetwork(); e != nil {
+		return e
+	}
+	if e := c.validateOutbounds(); e != nil {
+		return e
+	}
 	for _, b := range []struct {
 		value string
 		v4    bool

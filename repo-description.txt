@@ -1,1 +1,1 @@
-Kat：用 Go 编写的 Linux 服务端代理内核，支持 SOCKS5、AnyTLS、Shadowsocks 与 Trojan，提供有界资源管理。
+Kat：用 Go 编写的 Linux 服务端代理内核，支持 SOCKS5、AnyTLS、Shadowsocks 与 Trojan，提供出站、策略组与规则分流及有界资源管理。

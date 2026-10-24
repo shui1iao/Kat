@@ -1,0 +1,32 @@
+{
+  "inbounds": [{"protocol":"socks5", "listen":"127.0.0.1:10820", "users":[{"username":"example-user", "password":"replace-with-your-own-password"}]}],
+  "udp_bind_ipv4": "127.0.0.1", "udp_bind_ipv6": "::1",
+  "outbounds": [
+    {"name":"local-ss2022", "type":"shadowsocks", "server":"127.0.0.1", "port":10813, "method":"2022-blake3-aes-128-gcm", "key":"AAECAwQFBgcICQoLDA0ODw=="},
+    {"name":"local-ss2017", "type":"shadowsocks", "server":"127.0.0.1", "port":10812, "method":"aes-128-gcm", "password":"replace-with-high-entropy-secret"},
+    {"name":"local-trojan", "type":"trojan", "server":"127.0.0.1", "port":10810, "password":"replace-with-your-own-password", "tls":{"server_name":"localhost", "ca":"server.crt"}},
+    {"name":"local-anytls", "type":"anytls", "server":"127.0.0.1", "port":10815, "password":"replace-with-high-entropy-secret", "tls":{"server_name":"localhost", "ca":"server.crt"}},
+    {"name":"socks-via-ss2022", "type":"socks5", "server":"127.0.0.1", "port":10808, "username":"example-user", "password":"replace-with-your-own-password", "via":"local-ss2022"}
+  ],
+  "groups": [
+    {"name":"auto", "type":"url-test", "members":["local-ss2022", "local-trojan"], "probe":{"url":"http://127.0.0.1:8080/generate_204", "interval":"10m", "timeout":"5s"}, "tolerance":"100ms"},
+    {"name":"backup", "type":"fallback", "members":["local-anytls", "local-ss2017"], "probe":{"url":"http://127.0.0.1:8080/generate_204"}},
+    {"name":"smart", "type":"smart", "members":["local-ss2022", "local-anytls", "socks-via-ss2022"], "probe":{"url":"http://127.0.0.1:8080/generate_204"}, "priority":{"socks-via-ss2022":1.5}},
+    {"name":"pick", "type":"select", "members":["auto", "backup", "smart", "direct"], "selected":"auto"}
+  ],
+  "rule_sets": [
+    {"name":"block-list", "format":"domain", "path":"examples/rules/block-domains.txt"},
+    {"name":"proxy-list", "format":"classical", "path":"examples/rules/proxy-classical.txt"}
+  ],
+  "routing": {
+    "rules": [
+      {"rule_set":"block-list", "action":"reject"},
+      {"rule_set":"proxy-list", "outbound":"pick"},
+      {"domain_suffix":"example.net", "outbound":"smart"},
+      {"geoip":"private", "action":"direct"},
+      {"network":"udp", "outbound":"local-ss2022"}
+    ],
+    "final": "direct"
+  },
+  "limits": {"connections":64, "handshakes":8, "dials":8, "udp_associations":8, "udp_queue":4, "udp_targets":16, "pool_buffers":16, "handshake_timeout":"10s", "dial_timeout":"5s", "drain_timeout":"5s", "udp_idle":"60s"}
+}

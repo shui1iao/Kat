@@ -602,7 +602,8 @@ func TestUDPSessionsWindowMigrationAndExpiration(t *testing.T) {
 			if _, _, e = s.EncodeUDP(p, testTarget, []byte("r")); e != nil {
 				t.Fatal("session expired before60", e)
 			}
-			now = now.Add(2 * time.Second)
+			// The legal response above also renewed the session idle.
+			now = now.Add(replayTTL)
 			if _, _, e = s.EncodeUDP(p, testTarget, []byte("r")); !errors.Is(e, ErrSessionExpired) {
 				t.Fatal(e)
 			}

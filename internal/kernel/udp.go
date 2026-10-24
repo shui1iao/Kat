@@ -20,6 +20,7 @@ type packet struct {
 type udpAssociation struct {
 	server                       *Server
 	writeBack                    func(Address, []byte) error
+	ssNative                     bool // only native SS uses bidirectional target idle refresh
 	ctx                          context.Context
 	cancel                       context.CancelFunc
 	stream                       net.Conn
@@ -33,6 +34,11 @@ type udpAssociation struct {
 	client                       netip.AddrPort
 	allowed                      map[netip.AddrPort]time.Time
 	wg                           sync.WaitGroup
+	// Routing: client address (src_ip_cidr only, never logged) and the lazily
+	// created per-outbound proxy sessions (guarded by mu).
+	source      netip.Addr
+	proxies     map[string]*proxySession
+	proxyClosed bool
 }
 
 func (s *Server) resolve(ctx context.Context, a Address) (netip.AddrPort, error) {
@@ -62,6 +68,7 @@ func (s *Server) resolve(ctx context.Context, a Address) (netip.AddrPort, error)
 }
 func (s *Server) serveUDP(c net.Conn, r request) error {
 	if !acquire(s.udpSlots) {
+		s.failure(failUDPBudget, "udp", -1)
 		_ = r.respond(c, nil, false)
 		return errors.New("UDP association limit")
 	}
@@ -73,6 +80,10 @@ func (s *Server) serveUDP(c net.Conn, r request) error {
 	}
 	ctx, cancel := context.WithCancel(parent)
 	a := &udpAssociation{server: s, ctx: ctx, cancel: cancel, stream: c, req: r, queue: make(chan packet, s.cfg.Limits.UDPQueue), allowed: make(map[netip.AddrPort]time.Time)}
+	a.source = sourceOf(parent)
+	if !a.source.IsValid() {
+		a.source = addrIP(c.RemoteAddr())
+	}
 	defer cancel()
 	var e error
 	a.outbound4, e = net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP(s.cfg.UDPBindIPv4)})
@@ -176,6 +187,7 @@ func (a *udpAssociation) enqueue(p packet) {
 		old := a.queuedBytes.Load()
 		if n > limit-old {
 			a.server.counters.Dropped.Add(1)
+			a.server.failure(failUDPQueue, "udp", -1)
 			return
 		}
 		if a.queuedBytes.CompareAndSwap(old, old+n) {
@@ -189,6 +201,7 @@ func (a *udpAssociation) enqueue(p packet) {
 	default:
 		a.queuedBytes.Add(-n)
 		a.server.counters.Dropped.Add(1)
+		a.server.failure(failUDPQueue, "udp", -1)
 	}
 }
 func (a *udpAssociation) nativeLoop() error {
@@ -204,16 +217,19 @@ func (a *udpAssociation) nativeLoop() error {
 		a.mu.Unlock()
 		if src.Addr() != client.Addr() || (client.Port() != 0 && src.Port() != client.Port()) {
 			a.server.counters.Dropped.Add(1)
+			a.server.failure(failUDPInvalid, "udp", -1)
 			continue
 		}
 		if n < 4 || b[0] != 0 || b[1] != 0 || b[2] != 0 {
 			a.server.counters.Dropped.Add(1)
+			a.server.failure(failUDPInvalid, "udp", -1)
 			continue
 		}
 		reader := bytes.NewReader(b[3:n])
 		target, e := readAddress(reader, false)
 		if e != nil || reader.Len() > maxDatagram || target.Port == 0 {
 			a.server.counters.Dropped.Add(1)
+			a.server.failure(failUDPInvalid, "udp", -1)
 			continue
 		}
 		a.mu.Lock()
@@ -248,15 +264,39 @@ func (a *udpAssociation) streamLoop() error {
 }
 func (a *udpAssociation) sendLoop() {
 	idle := a.server.cfg.Limits.UDPIdle.value()
+	// Proxy sessions never outlive the association's sender.
+	defer a.closeProxies()
 	for {
 		select {
 		case <-a.ctx.Done():
 			return
 		case p := <-a.queue:
 			a.queuedBytes.Add(-int64(len(p.payload)))
-			target, e := a.server.resolve(a.ctx, p.target)
+			candidates, proxy, host, e := a.server.routeUDP(a.ctx, p.target, a.source)
 			if e != nil {
 				a.server.counters.Dropped.Add(1)
+				a.server.resolutionFailure(e)
+				continue
+			}
+			if proxy != "" {
+				a.sendProxy(proxy, Address{host, p.target.Port}, p.payload)
+				continue
+			}
+			var target netip.AddrPort
+			var socket *net.UDPConn
+			for _, ip := range candidates {
+				sock := a.outbound4
+				if ip.Addr().Is6() {
+					sock = a.outbound6
+				}
+				if sock != nil {
+					target, socket = ip, sock
+					break
+				}
+			}
+			if socket == nil {
+				a.server.counters.Dropped.Add(1)
+				a.server.failure(failUDPInvalid, "udp", -1)
 				continue
 			}
 			now := time.Now()
@@ -270,24 +310,20 @@ func (a *udpAssociation) sendLoop() {
 			if !exists && len(a.allowed) >= a.server.cfg.Limits.UDPTargets {
 				a.mu.Unlock()
 				a.server.counters.Dropped.Add(1)
+				a.server.failure(failUDPTargets, "udp", -1)
 				continue
 			}
 			a.allowed[target] = now
 			a.mu.Unlock()
-			socket := a.outbound4
-			if target.Addr().Is6() {
-				socket = a.outbound6
-			}
-			if socket == nil {
-				a.server.counters.Dropped.Add(1)
-				continue
-			}
 			socket.SetWriteDeadline(now.Add(a.server.cfg.Limits.DialTimeout.value()))
 			if _, e = socket.WriteToUDPAddrPort(p.payload, target); e != nil {
 				a.server.counters.Dropped.Add(1)
+				a.server.failure(failUDPIO, "udp", -1)
 				continue
 			}
-			a.activity.Store(time.Now().UnixNano())
+			if !a.ssNative {
+				a.activity.Store(time.Now().UnixNano())
+			}
 		}
 	}
 }
@@ -304,47 +340,95 @@ func (a *udpAssociation) returnLoop(socket *net.UDPConn) {
 			return
 		}
 		src = netip.AddrPortFrom(src.Addr().Unmap(), src.Port())
+		now := time.Now()
 		a.mu.Lock()
-		last, ok := a.allowed[src]
 		client := a.client
 		a.mu.Unlock()
-		if !ok || time.Since(last) > idle || n > maxDatagram {
+		if !a.acceptReturn(src, n, now, idle) {
 			a.server.counters.Dropped.Add(1)
+			a.server.failure(failUDPSource, "udp", -1)
 			continue
 		}
-		a.activity.Store(time.Now().UnixNano())
 		payload := b[:n]
 		source := Address{src.Addr().String(), src.Port()}
-		a.outputMu.Lock()
-		if a.writeBack != nil {
-			e = a.writeBack(source, payload)
-		} else if a.req.UDPWrite != nil {
-			a.stream.SetWriteDeadline(time.Now().Add(idle))
-			e = a.req.UDPWrite(source, payload)
-		} else if a.native != nil {
-			if client.Port() == 0 {
-				a.outputMu.Unlock()
-				continue
-			}
-			out := appendAddress([]byte{0, 0, 0}, source, false)
-			out = append(out, payload...)
-			if len(out) > maxDatagram {
-				a.server.counters.Dropped.Add(1)
-				a.outputMu.Unlock()
-				continue
-			}
-			a.native.SetWriteDeadline(time.Now().Add(a.server.cfg.Limits.DialTimeout.value()))
-			_, e = a.native.WriteToUDPAddrPort(out, client)
-		} else {
-			out := a.req.Datagrams.AppendPacket(nil, source, payload)
-			a.stream.SetWriteDeadline(time.Now().Add(idle))
-			e = writeAll(a.stream, out)
-		}
-		a.outputMu.Unlock()
-		if e != nil {
+		if e = a.output(client, source, payload, idle); e != nil {
 			return
 		}
 	}
 }
 
+// output writes one reply datagram back to the client through whichever
+// inbound path owns this association (SS native writeBack, UDPWrite stream,
+// SOCKS5 native socket or a datagram codec). Shared by direct and proxy replies.
+func (a *udpAssociation) output(client netip.AddrPort, source Address, payload []byte, idle time.Duration) error {
+	var e error
+	a.outputMu.Lock()
+	defer a.outputMu.Unlock()
+	if a.writeBack != nil {
+		e = a.writeBack(source, payload)
+	} else if a.req.UDPWrite != nil {
+		a.stream.SetWriteDeadline(time.Now().Add(idle))
+		e = a.req.UDPWrite(source, payload)
+	} else if a.native != nil {
+		if client.Port() == 0 {
+			return nil
+		}
+		out := appendAddress([]byte{0, 0, 0}, source, false)
+		out = append(out, payload...)
+		if len(out) > maxDatagram {
+			a.server.counters.Dropped.Add(1)
+			a.server.failure(failUDPInvalid, "udp", -1)
+			return nil
+		}
+		a.native.SetWriteDeadline(time.Now().Add(a.server.cfg.Limits.DialTimeout.value()))
+		_, e = a.native.WriteToUDPAddrPort(out, client)
+	} else {
+		out := a.req.Datagrams.AppendPacket(nil, source, payload)
+		a.stream.SetWriteDeadline(time.Now().Add(idle))
+		e = writeAll(a.stream, out)
+	}
+	return e
+}
+
 // Datagram-over-stream parsing always uses ReadFull, never TCP Read boundaries.
+
+// ssIdleExpired uses the same last-valid-activity timestamp as target readers.
+// It is SS-only: other protocols retain their existing idle/default behavior.
+func (a *udpAssociation) ssIdleExpired(now time.Time) bool {
+	return now.Sub(time.Unix(0, a.activity.Load())) >= a.server.cfg.Limits.UDPIdle.value()
+}
+
+// An exact target must already be authorized and not idle-expired BEFORE a reply
+// can renew it. Unknown/expired sources and oversized datagrams never keep it alive.
+// Refreshing only native SS preserves other protocol target-expiry semantics.
+func (a *udpAssociation) acceptReturn(src netip.AddrPort, n int, now time.Time, idle time.Duration) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	last, ok := a.allowed[src]
+	expired := now.Sub(last) > idle
+	if a.ssNative {
+		expired = now.Sub(last) >= idle
+	}
+	if !ok || expired || n > maxDatagram {
+		return false
+	}
+	if a.ssNative {
+		if now.After(last) {
+			a.allowed[src] = now
+		}
+		a.touchSSActivity(now)
+	} else {
+		a.activity.Store(now.UnixNano())
+	}
+	return true
+}
+
+// Concurrent SS readers/replies must not move the idle deadline backwards.
+func (a *udpAssociation) touchSSActivity(now time.Time) {
+	n := now.UnixNano()
+	for old := a.activity.Load(); n > old; old = a.activity.Load() {
+		if a.activity.CompareAndSwap(old, n) {
+			return
+		}
+	}
+}

@@ -1,0 +1,27 @@
+{
+  "inbounds": [
+    {
+      "protocol": "socks5",
+      "listen": "127.0.0.1:1080"
+    }
+  ],
+  "dns": {
+    "server": "127.0.0.1:5353",
+    "cache_entries": 256
+  },
+  "routing": {
+    "rules": [
+      {
+        "domain_suffix": "blocked.example",
+        "action": "reject"
+      },
+      {
+        "ip_cidr": "192.0.2.0/24",
+        "action": "reject"
+      }
+    ]
+  },
+  "limits": {
+    "udp_idle": "5m"
+  }
+}

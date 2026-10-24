@@ -126,7 +126,7 @@ func (s *Server) prepareEncrypted() error {
 			rt := ssByID[id]
 			if rt == nil {
 				key, _ := in.SS.key()
-				codec, e := ss.NewServer(ss.Config{Method: in.SS.Method, Key: key, MaxTCPSalts: in.SS.TCPSalts, Max2017Salts: in.SS.Salts2017, MaxUDPSessions: in.SS.Sessions})
+				codec, e := ss.NewServer(ss.Config{Method: in.SS.Method, Key: key, MaxTCPSalts: in.SS.TCPSalts, Max2017Salts: in.SS.Salts2017, MaxUDPSessions: in.SS.Sessions, UDPIdle: s.cfg.Limits.UDPIdle.value()})
 				if e != nil {
 					return errors.New("cannot initialize SS protection")
 				}
