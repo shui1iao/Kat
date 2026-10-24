@@ -1,6 +1,6 @@
 # Kat
 
-Kat 是用 Go 编写的 Linux 服务端代理内核，提供有界资源管理、TCP 转发和 UDP 转发。从 0.6.0 起，Kat 还可以把流量交给上游代理转发：支持出站、链式代理、策略组和规则分流。当前版本 **0.6.1**，命令名为 `kat`，模块名为 `github.com/shui1iao/Kat`。本项目不提供图形客户端、TUN 或公网管理接口。
+Kat 是用 Go 编写的 Linux 服务端代理内核，提供有界资源管理、TCP 转发和 UDP 转发。从 0.6.0 起，Kat 还可以把流量交给上游代理转发：支持出站、链式代理、策略组和规则分流。当前版本 **0.6.2**，命令名为 `kat`，模块名为 `github.com/shui1iao/Kat`。本项目不提供图形客户端、TUN 或公网管理接口。
 
 ## 入站协议范围
 
@@ -33,16 +33,16 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o kat ./cmd/kat
 ./kat run examples/socks5.json
 ```
 
-`version` 输出 `kat 0.6.1`。`check` 严格检查 JSON、未知字段、凭据组合、限额及 TLS 证书/私钥配对（AnyTLS 入站省略 `tls` 时，`check` 同样会在内存中生成一张随机证书，与之后 `run` 使用的不是同一张），也会读取出站 `tls.ca` 指定的文件，但不建立监听、不联网、不下载，也不读取规则集或 GeoIP 文件（它们在 `run` 时加载）。`run` 启动服务；收到 SIGINT/SIGTERM 后停止接入，在 `drain_timeout` 内等待，超时取消并回收。
+`version` 输出 `kat 0.6.2`。`check` 严格检查 JSON、未知字段、凭据组合、限额及 TLS 证书/私钥配对（AnyTLS 入站省略 `tls` 时，`check` 同样会在内存中生成一张随机证书，与之后 `run` 使用的不是同一张），也会读取出站 `tls.ca` 指定的文件，但不建立监听、不联网、不下载，也不读取规则集或 GeoIP 文件（它们在 `run` 时加载）。`run` 启动服务；收到 SIGINT/SIGTERM 后停止接入，在 `drain_timeout` 内等待，超时取消并回收。
 
 `third_party/reality` 是带本地修改的实际构建依赖，不能删除或擅自移除 `go.mod` 中的本地 `replace`。首次构建需要准备 `go.mod`/`go.sum` 指定的依赖；依赖齐全后可以使用 `GOTOOLCHAIN=local GOPROXY=off GOFLAGS=-mod=readonly` 离线构建。源码未内置全部依赖缓存。
 
-Release 提供 `kat-0.6.1-linux-amd64`、对应 `.sha256` 及第三方许可附件。可先校验，再改为便于调用的名称：
+Release 提供 `kat-0.6.2-linux-amd64`、对应 `.sha256` 及第三方许可附件。可先校验，再改为便于调用的名称：
 
 ```sh
-sha256sum -c kat-0.6.1-linux-amd64.sha256
-chmod +x kat-0.6.1-linux-amd64
-./kat-0.6.1-linux-amd64 version
+sha256sum -c kat-0.6.2-linux-amd64.sha256
+chmod +x kat-0.6.2-linux-amd64
+./kat-0.6.2-linux-amd64 version
 ```
 
 ## 配置与示例
@@ -58,7 +58,7 @@ chmod +x kat-0.6.1-linux-amd64
 - `inbounds`：1–64 个入口；`protocol` 为协议标识，`listen` 为字面 IP 加端口，IPv6 使用 `[::1]:端口`。
 - SOCKS5 的 `users` 使用 `username`/`password`；非回环监听必须配置用户，配置后不回退为无认证。SOCKS5 本身不加密，也不支持 TLS 包装，不应作为未加密的公网服务。
 - Trojan 的 `users` 只使用 `password`，并且必须配置 `tls`。
-- AnyTLS 使用 `anytls.password`，不填 `users`。`tls` 可以省略：省略时 Kat 使用每次启动随机生成的自签证书（ECDSA P-256，名称为 `localhost`，只在内存中，不写盘），**客户端必须跳过证书校验**；证书每次重启都会变，无法固定指纹，也无法用 CA 校验，因此不能防范中间人。写了 `tls` 时 `cert` 和 `key` 都必填，`tls` 写成 `null`、`{}` 或缺少其中任一项都会被拒绝。`max_sessions`、`max_streams`、`session_streams`、`stream_bytes`、`session_bytes`、`slow_timeout` 限制会话、逻辑流、缓冲和慢消费者。同密码的入口共享身份及预算，冲突配置会被拒绝。
+- AnyTLS 使用 `anytls.password`，不填 `users`。`tls` 可以省略：省略时 Kat 使用每次启动随机生成的自签证书（ECDSA P-256，名称为 `localhost`，只在内存中，不写盘），**客户端必须跳过证书校验**；证书每次重启都会变，无法固定指纹，也无法用 CA 校验，因此不能防范中间人。写了 `tls` 时 `cert` 和 `key` 都必填，`tls` 写成 `null`、`{}` 或缺少其中任一项都会被拒绝。`max_sessions`、`max_streams`、`session_streams`、`stream_bytes`、`session_bytes`、`slow_timeout` 限制会话、逻辑流、缓冲和慢消费者，默认值见下文“AnyTLS 身份额度”。同密码的入口共享身份及预算，冲突配置会被拒绝。
 - Shadowsocks 使用 `ss.method` 及相应凭据，不填 `users` 或 `tls`。`ss.tcp_salts`、`ss.salts_2017`、`ss.sessions` 控制有界保护状态；填 0 表示默认，不是禁用校验。相同方法和实际密钥的入口共享身份、重放保护及 UDP 关联，保护设置必须一致。
 - `tls.cert`、`tls.key` 指向自行准备的证书和私钥，路径相对启动时的工作目录。Trojan/AnyTLS 入站示例需要先准备 `server.crt` 和 `server.key`（`anytls-tls.json` 演示的是自备证书写法）；`routing.json` 的 Trojan/AnyTLS 出站用同一份 `server.crt` 作为 `tls.ca`，证书需包含 `localhost`。仓库不附生产证书或私钥。
 - `udp_bind_ipv4`、`udp_bind_ipv6` 可指定直连（direct）UDP 出站的本机源地址；省略时由系统路由选择。它们不是访问控制系统。
@@ -67,16 +67,34 @@ chmod +x kat-0.6.1-linux-amd64
 
 | 字段 | 默认值 | 作用 |
 | --- | --- | --- |
-| `connections` / `logical_streams` | 1024 / 256 | 物理连接与逻辑流额度 |
-| `handshakes` / `dials` | 64 / 64 | 并发握手及拨号额度 |
-| `udp_associations` | 128 | UDP 关联额度 |
+| `connections` / `logical_streams` | 4096 / `max(8192, 各 AnyTLS 身份 max_streams 之和)` | 物理连接与逻辑流额度 |
+| `handshakes` / `dials` | 512 / 512 | 并发握手及拨号额度 |
+| `udp_associations` | 1024 | UDP 关联额度 |
 | `udp_queue` / `udp_queue_bytes` | 16 / `udp_queue × 65507` | 每关联队列的包数与载荷字节预算 |
-| `udp_targets` | 64 | 每关联有效回包目标数 |
+| `udp_targets` | 256 | 每关联有效回包目标数 |
 | `buffer_size` / `pool_buffers` | 16384 / 128 | 普通复制缓冲大小与池缓存数量 |
 | `handshake_timeout` / `dial_timeout` | 10s / 5s | 握手与拨号超时；经代理出站时两者之和是拨号（含整条链路握手）的总预算 |
 | `drain_timeout` / `udp_idle` | 5s / 60s | 退出等待与 UDP 闲置超时；`udp_idle` 也用于代理 UDP 会话的空闲回收 |
 | `tcp_idle` | 0 | TCP 活动闲置超时，默认关闭 |
 | `disable_fast_path` | false | 强制使用普通缓冲复制路径 |
+
+计数类字段的取值范围与 0.6.1 相同（`connections`、`logical_streams`、`handshakes`、`dials`、`udp_associations`、`pool_buffers` 为 1–65536，`udp_targets` 为 1–1024），显式填写的值按原规则校验和生效，只有省略的字段才取上表的默认值。
+
+`logical_streams` 的自动取值：所有不同密码 AnyTLS 身份的 `max_streams` 之和必须不超过 `logical_streams`。省略（或填 0）时自动取 `max(8192, 该和)`，同一密码出现在多个入口只计一次，因此多个 AnyTLS 身份都用默认额度也能通过检查（例如 3 个默认身份得到 12288）；该和超过 65536 时仍会被拒绝，需要为各身份显式填写较小的 `max_streams`。显式填写 `logical_streams` 时不做任何自动调整，超出即被 `kat check` 拒绝。
+
+AnyTLS 身份额度（写在 `anytls` 对象内，同密码的入口共享）：
+
+| 字段 | 默认值 | 作用 |
+| --- | --- | --- |
+| `max_sessions` | 512（上限 65536） | 同一密码的物理会话（TLS 连接）总数。Surge、mihomo、sing-box 等客户端在没有空闲会话时会为每个并发请求新开会话，因此它大致等于该密码下所有用户的并发连接数 |
+| `max_streams` | 4096（上限 65536） | 同一密码跨所有会话的逻辑流总数 |
+| `session_streams` | 64（上限 64） | 单个会话内的并发逻辑流 |
+| `stream_bytes` / `session_bytes` | 131072 / 1048576 | 单流 / 单会话的缓冲预算，入、出方向分别计费 |
+| `slow_timeout` | 60s（取值 1ms–60s） | 慢消费者及写入超时：缓冲满后等待对端读取的最长时间，超时关闭整个会话 |
+
+默认额度按几位用户用 Surge、mihomo、sing-box 日常浏览、看视频、玩游戏的负载设定；超过额度时直接拒绝，不会无限占用内存。
+
+**内存说明。** 正常使用时 Kat 的内存占用不大：在本机回环上用 sing-box 作客户端、几百个并发流（AnyTLS、Shadowsocks 2022、Trojan，含 UDP）测试，进程 RSS 峰值约 35–105 MiB；500 个 AnyTLS 会话各下载 4 MiB、客户端先暂停读取 6 秒的压力场景约 105–116 MiB。但默认值下字节型缓冲的理论上界较大：持有凭据的使用者如果刻意把所有队列都占满，单个 AnyTLS 身份时约 2.8 GiB（主要是 AnyTLS 会话缓冲 `min(max_sessions × 2 × session_bytes, max_streams × 2 × stream_bytes)` 约 1 GiB，加上 UDP 关联队列 `udp_associations × udp_queue_bytes` 约 1 GiB），每多一个使用默认额度的 AnyTLS 身份再增加约 1 GiB。2 GB 等内存较小的机器，或需要隔离不可信用户时，请在配置中显式填写更小的值，例如 `limits.udp_associations: 256`，以及 AnyTLS 的 `max_sessions: 128`、`max_streams: 1024`，这两项缓冲各降到约 256 MiB；也可以减小 `connections`、`session_bytes`、`stream_bytes`。`slow_timeout` 不改变这些上界，只决定对端不读时缓冲最多被占用多久。
 
 这些额度不是整个进程的内存硬上限；TLS、协议保护状态、Go 栈和内核 socket 等还有额外开销。队列满可能丢弃 UDP 包。回包仅允许来自关联实际请求过且未过期的精确 IP:port，不承诺任意 full-cone。SOCKS5 UDP 不接受跨 IP 重绑定；同 IP 的不可信进程可能在未限定源端口时抢占首个 UDP 包，部署者需要限制访问。
 
@@ -182,9 +200,9 @@ SS 原生 UDP 的闲置按“最后一次合法活动之后”计时：通过认
 
 ## 验证与性能口径
 
-0.6.0 已有普通测试、出站与内核包的竞态检测、`GOOS=windows` 交叉编译，以及真实进程的端到端测试：出站、链式代理、四种策略组的切换与降级、各类规则命中的实际走向，均以 sing-box 1.14.3 和 Kat 自身作为本机上游服务端验证；另做过 2 小时本机回环浸泡。0.6.1 重新运行了全部普通测试、`GOOS=windows` 交叉编译和真实进程端到端测试，并为随机证书模式新增单元测试和真实进程端到端测试（以 Kat 自身的 AnyTLS 出站作为客户端）；竞态检测和回环浸泡没有针对 0.6.1 重做。它们不是一般安全审计，也不代表所有发行版、客户端与配置组合均已验证。
+0.6.0 已有普通测试、出站与内核包的竞态检测、`GOOS=windows` 交叉编译，以及真实进程的端到端测试：出站、链式代理、四种策略组的切换与降级、各类规则命中的实际走向，均以 sing-box 1.14.3 和 Kat 自身作为本机上游服务端验证；另做过 2 小时本机回环浸泡。0.6.1 重新运行了全部普通测试、`GOOS=windows` 交叉编译和真实进程端到端测试，并为随机证书模式新增单元测试和真实进程端到端测试（以 Kat 自身的 AnyTLS 出站作为客户端）；竞态检测和回环浸泡没有针对 0.6.1 重做。0.6.2 调大默认额度并把 AnyTLS `slow_timeout` 默认值改为 60s，重新运行了全部普通测试、`GOOS=windows` 交叉编译和真实进程端到端测试，新增默认值与显式值的单元测试，并以 sing-box 1.14.3 作客户端、Kat 配置不写任何额度，在本机回环上做了 AnyTLS、Shadowsocks 2022、Trojan 的数百并发流测试和 AnyTLS 暂停读取后大下载的压力测试；竞态检测和回环浸泡没有针对 0.6.2 重做。它们不是一般安全审计，也不代表所有发行版、客户端与配置组合均已验证。
 
-**尚未验证：** Windows 实机运行（只做了交叉编译）；真实 GeoIP 库与公网规则集下载（只用了自制 mmdb 和本机 HTTPS 源）；更长时间运行（只做过 2 小时回环浸泡）；高并发与性能（本版本没有做性能测试）；随机证书模式只用 Kat 自己的 AnyTLS 出站作为客户端测试过，其他客户端未测试。0.5.20 的静态二进制曾在 Debian 11 / glibc 2.31 完成版本与配置检查，0.6.0、0.6.1 构建方式相同，但没有重复该项检查。
+**尚未验证：** Windows 实机运行（只做了交叉编译）；真实 GeoIP 库与公网规则集下载（只用了自制 mmdb 和本机 HTTPS 源）；更长时间运行（只做过 2 小时回环浸泡）；性能（本版本没有做性能测试）；第三方客户端并发只用 sing-box 测试过，没有用 Surge、mihomo，也没有跨公网、真实延迟下测试；没有在 2 GB 内存的机器上实测，内存结论来自 8 GB 机器上的进程 RSS 与算式；随机证书模式只用 Kat 自己的 AnyTLS 出站作为客户端测试过，其他客户端未测试。0.5.20 的静态二进制曾在 Debian 11 / glibc 2.31 完成版本与配置检查，0.6.0–0.6.2 构建方式相同，但没有重复该项检查。
 
 0.5.20 记录的短时性能观察仅对应 Linux 主机的 **2 核 / 4 GiB、总带宽 5G、64 并发、每轮 10 秒并重复 3 次**的特定受限口径，且只涉及入站转发，不代表出站、策略组或规则分流的性能；它不是独立峰值、长期稳定性或生产就绪证明。本版本不作性能领先、长期 SLO 或生产可用性承诺。
 

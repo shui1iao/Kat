@@ -21,6 +21,21 @@ type AnyTLSOptions struct {
 	SlowTimeout    Duration `json:"slow_timeout,omitempty"`
 }
 
+// Third-party clients (Surge, mihomo, sing-box) open a new session whenever no
+// idle one exists, so max_sessions is effectively the identity's concurrent
+// connection count across all of its users.
+//
+// slow_timeout bounds how long a session write may stay blocked on a peer that
+// is not reading. Such clients multiplex many streams over one session, so a
+// short pause in reading followed by many large downloads can keep a busy
+// session blocked for longer than 10s; 60s (the maximum) avoids closing it.
+const (
+	defaultAnyTLSSessions       = 512
+	defaultAnyTLSStreams        = 4096
+	defaultAnyTLSSessionStreams = 64
+	defaultAnyTLSSlowTimeout    = 60 * time.Second
+)
+
 func (o *AnyTLSOptions) normalize() error {
 	if o == nil || len(o.Password) == 0 || len(o.Password) > 4096 {
 		return errors.New("AnyTLS requires single password")
@@ -28,7 +43,7 @@ func (o *AnyTLSOptions) normalize() error {
 	defs := []struct {
 		p      *int
 		v, max int
-	}{{&o.MaxSessions, 32, 65536}, {&o.MaxStreams, 64, 65536}, {&o.SessionStreams, 16, 64}, {&o.StreamBytes, 131072, 4 << 20}, {&o.SessionBytes, 1048576, 16 << 20}}
+	}{{&o.MaxSessions, defaultAnyTLSSessions, 65536}, {&o.MaxStreams, defaultAnyTLSStreams, 65536}, {&o.SessionStreams, defaultAnyTLSSessionStreams, 64}, {&o.StreamBytes, 131072, 4 << 20}, {&o.SessionBytes, 1048576, 16 << 20}}
 	for _, d := range defs {
 		if *d.p == 0 {
 			*d.p = d.v
@@ -41,7 +56,7 @@ func (o *AnyTLSOptions) normalize() error {
 		return errors.New("AnyTLS byte budgets must fit full frame")
 	}
 	if o.SlowTimeout == 0 {
-		o.SlowTimeout = Duration(10 * time.Second)
+		o.SlowTimeout = Duration(defaultAnyTLSSlowTimeout)
 	}
 	if o.SlowTimeout.value() < time.Millisecond || o.SlowTimeout.value() > time.Minute {
 		return errors.New("invalid AnyTLS slow timeout")

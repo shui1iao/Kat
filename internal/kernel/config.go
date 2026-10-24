@@ -85,7 +85,26 @@ type Limits struct {
 	TCPIdle          Duration `json:"tcp_idle"`
 	UDPIdle          Duration `json:"udp_idle"`
 	DisableFastPath  bool     `json:"disable_fast_path"`
+	// logicalAuto is the value Validate derived for an omitted/0
+	// logical_streams (0 = written explicitly). While LogicalStreams still
+	// holds that value, re-validation recomputes it as
+	// max(defaultLogicalStreams, sum of AnyTLS identity max_streams).
+	logicalAuto int
 }
+
+// Defaults sized for several users with Surge/mihomo/sing-box clients that
+// open one AnyTLS session (or one TCP connection) per concurrent request.
+// All values remain hard bounded and explicit values keep 0.6.1 semantics.
+const (
+	defaultConnections     = 4096
+	defaultLogicalStreams  = 8192
+	defaultHandshakes      = 512
+	defaultDials           = 512
+	defaultUDPAssociations = 1024
+	defaultUDPTargets      = 256
+	maxResourceCount       = 65536
+)
+
 type Config struct {
 	DNS         *DNSOptions     `json:"dns,omitempty"`
 	Routing     *RoutingOptions `json:"routing,omitempty"`
@@ -147,14 +166,20 @@ func (c *Config) Validate() error {
 			*p = v
 		}
 	}
-	def(&l.Connections, 1024)
-	def(&l.LogicalStreams, 256)
-	def(&l.Handshakes, 64)
-	def(&l.Dials, 64)
-	def(&l.UDPAssociations, 128)
+	logicalAuto := l.LogicalStreams == 0 || (l.logicalAuto != 0 && l.LogicalStreams == l.logicalAuto)
+	l.logicalAuto = 0
+	if logicalAuto {
+		// Raised below to cover all AnyTLS identity worker budgets.
+		l.LogicalStreams = defaultLogicalStreams
+		l.logicalAuto = l.LogicalStreams
+	}
+	def(&l.Connections, defaultConnections)
+	def(&l.Handshakes, defaultHandshakes)
+	def(&l.Dials, defaultDials)
+	def(&l.UDPAssociations, defaultUDPAssociations)
 	def(&l.UDPQueue, 16)
 	def(&l.UDPQueueBytes, l.UDPQueue*maxDatagram)
-	def(&l.UDPTargets, 64)
+	def(&l.UDPTargets, defaultUDPTargets)
 	def(&l.BufferSize, 16384)
 	def(&l.PoolBuffers, 128)
 	dd := func(p *Duration, v time.Duration) {
@@ -168,7 +193,7 @@ func (c *Config) Validate() error {
 	dd(&l.UDPIdle, 60*time.Second)
 
 	for _, v := range []int{l.Connections, l.LogicalStreams, l.Handshakes, l.Dials, l.UDPAssociations, l.PoolBuffers} {
-		if v < 1 || v > 65536 {
+		if v < 1 || v > maxResourceCount {
 			return errors.New("resource count must be between 1 and 65536")
 		}
 	}
@@ -395,6 +420,13 @@ func (c *Config) Validate() error {
 	totalAnyWorkers := 0
 	for _, o := range seenAny {
 		totalAnyWorkers += o.MaxStreams
+	}
+	if logicalAuto && totalAnyWorkers > l.LogicalStreams {
+		if totalAnyWorkers > maxResourceCount {
+			return errors.New("AnyTLS identity worker budgets exceed the 65536 logical_streams maximum; set explicit max_streams per identity")
+		}
+		l.LogicalStreams = totalAnyWorkers
+		l.logicalAuto = l.LogicalStreams
 	}
 	if totalAnyWorkers > l.LogicalStreams {
 		return errors.New("AnyTLS identity worker budgets exceed logical_streams; allocate explicit bounded identity quotas")
