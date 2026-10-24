@@ -63,6 +63,10 @@ type Inbound struct {
 	ssRuntime     *ssRuntime
 	snellServer   *snell.Server
 	tlsConfig     *tls.Config
+	// tlsWritten: the JSON object had a "tls" member (even null).
+	// ephemeralTLS: tlsConfig holds a generated in-memory certificate.
+	tlsWritten   bool
+	ephemeralTLS bool
 }
 type Limits struct {
 	LogicalStreams   int      `json:"logical_streams"`
@@ -218,7 +222,8 @@ func (c *Config) Validate() error {
 		}
 		switch in.Protocol {
 		case "anytls":
-			if in.TLS == nil || len(in.Users) != 0 {
+			// Omitted "tls" = ephemeral certificate; a written but null "tls" stays an error.
+			if (in.TLS == nil && in.tlsWritten) || len(in.Users) != 0 {
 				return errors.New("AnyTLS requires TLS and single password options")
 			}
 			if e := in.AnyTLS.normalize(); e != nil {
@@ -333,6 +338,7 @@ func (c *Config) Validate() error {
 				return errors.New("cannot load TLS certificate/key")
 			}
 			in.tlsConfig = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+			in.ephemeralTLS = false
 			if in.Protocol == "vless" {
 				for _, u := range in.Users {
 					if u.Flow == VX.VisionFlow {
@@ -352,6 +358,14 @@ func (c *Config) Validate() error {
 					}
 				}
 			}
+		} else if in.Protocol == "anytls" && !in.ephemeralTLS {
+			// One certificate per loaded configuration: Start re-validating
+			// the same Config keeps it; every new Load generates a new one.
+			cfg, e := ephemeralTLSConfig(time.Now())
+			if e != nil {
+				return errors.New("cannot generate TLS certificate")
+			}
+			in.tlsConfig, in.ephemeralTLS = cfg, true
 		}
 	}
 	seenAny := map[string]AnyTLSOptions{}

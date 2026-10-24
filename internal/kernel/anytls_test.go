@@ -265,10 +265,11 @@ func TestAnyTLSServerFirstAndFINBoundary(t *testing.T) {
 		t.Fatal("FIN killed session")
 	}
 }
-func TestAnyTLSConfigRejectsPlaintext(t *testing.T) {
+func TestAnyTLSConfigNeverPlaintext(t *testing.T) {
+	// Without tls AnyTLS still runs over TLS, with an ephemeral certificate.
 	c := Config{Inbounds: []Inbound{{Protocol: "anytls", Listen: "127.0.0.1:0", AnyTLS: &AnyTLSOptions{Password: "x"}}}}
-	if c.Validate() == nil {
-		t.Fatal("plaintext AnyTLS allowed")
+	if e := c.Validate(); e != nil || c.Inbounds[0].tlsConfig == nil || !c.Inbounds[0].ephemeralTLS {
+		t.Fatalf("AnyTLS without tls: %v", e)
 	}
 }
 func TestAnyTLSIndependentPeerIntegration(t *testing.T) {

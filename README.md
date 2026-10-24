@@ -1,6 +1,6 @@
 # Kat
 
-Kat 是用 Go 编写的 Linux 服务端代理内核，提供有界资源管理、TCP 转发和 UDP 转发。从 0.6.0 起，Kat 还可以把流量交给上游代理转发：支持出站、链式代理、策略组和规则分流。当前版本 **0.6.0**，命令名为 `kat`，模块名为 `github.com/shui1iao/Kat`。本项目不提供图形客户端、TUN 或公网管理接口。
+Kat 是用 Go 编写的 Linux 服务端代理内核，提供有界资源管理、TCP 转发和 UDP 转发。从 0.6.0 起，Kat 还可以把流量交给上游代理转发：支持出站、链式代理、策略组和规则分流。当前版本 **0.6.1**，命令名为 `kat`，模块名为 `github.com/shui1iao/Kat`。本项目不提供图形客户端、TUN 或公网管理接口。
 
 ## 入站协议范围
 
@@ -9,7 +9,7 @@ Kat 是用 Go 编写的 Linux 服务端代理内核，提供有界资源管理�
 | 协议 | TCP | UDP 与边界 |
 | --- | --- | --- |
 | SOCKS5 | CONNECT；用户名/密码认证；仅回环地址允许无认证 | UDP ASSOCIATE；不支持 BIND、GSSAPI 或 UDP 分片重组 |
-| AnyTLS | v2，兼容 v1；必须使用真实 TLS；逻辑多流与会话复用 | UoT v2 的连接及非连接模式，不是原生 UDP，不支持 UoT v1；FIN 关闭整个逻辑流，不承诺 TCP 半关闭 |
+| AnyTLS | v2，兼容 v1；始终使用真实 TLS（省略 `tls` 时使用每次启动随机生成的自签证书，见下文）；逻辑多流与会话复用 | UoT v2 的连接及非连接模式，不是原生 UDP，不支持 UoT v1；FIN 关闭整个逻辑流，不承诺 TCP 半关闭 |
 | Shadowsocks 2017 | 单身份 AEAD | 原生 UDP；支持下列三种方法，不支持旧式流密码 |
 | Shadowsocks 2022 | 单身份 SIP022 | 原生 UDP；支持下列三种方法，不支持 EIH/iPSK 链或自动多用户密钥探测 |
 | Trojan | 原版密码认证，TLS 1.2/1.3 | UDP-over-TLS；没有完整 fallback 或反探测行为，认证失败直接关闭 |
@@ -33,16 +33,16 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o kat ./cmd/kat
 ./kat run examples/socks5.json
 ```
 
-`version` 输出 `kat 0.6.0`。`check` 严格检查 JSON、未知字段、凭据组合、限额及 TLS 证书/私钥配对，也会读取出站 `tls.ca` 指定的文件，但不建立监听、不联网、不下载，也不读取规则集或 GeoIP 文件（它们在 `run` 时加载）。`run` 启动服务；收到 SIGINT/SIGTERM 后停止接入，在 `drain_timeout` 内等待，超时取消并回收。
+`version` 输出 `kat 0.6.1`。`check` 严格检查 JSON、未知字段、凭据组合、限额及 TLS 证书/私钥配对（AnyTLS 入站省略 `tls` 时，`check` 同样会在内存中生成一张随机证书，与之后 `run` 使用的不是同一张），也会读取出站 `tls.ca` 指定的文件，但不建立监听、不联网、不下载，也不读取规则集或 GeoIP 文件（它们在 `run` 时加载）。`run` 启动服务；收到 SIGINT/SIGTERM 后停止接入，在 `drain_timeout` 内等待，超时取消并回收。
 
 `third_party/reality` 是带本地修改的实际构建依赖，不能删除或擅自移除 `go.mod` 中的本地 `replace`。首次构建需要准备 `go.mod`/`go.sum` 指定的依赖；依赖齐全后可以使用 `GOTOOLCHAIN=local GOPROXY=off GOFLAGS=-mod=readonly` 离线构建。源码未内置全部依赖缓存。
 
-Release 提供 `kat-0.6.0-linux-amd64`、对应 `.sha256` 及第三方许可附件。可先校验，再改为便于调用的名称：
+Release 提供 `kat-0.6.1-linux-amd64`、对应 `.sha256` 及第三方许可附件。可先校验，再改为便于调用的名称：
 
 ```sh
-sha256sum -c kat-0.6.0-linux-amd64.sha256
-chmod +x kat-0.6.0-linux-amd64
-./kat-0.6.0-linux-amd64 version
+sha256sum -c kat-0.6.1-linux-amd64.sha256
+chmod +x kat-0.6.1-linux-amd64
+./kat-0.6.1-linux-amd64 version
 ```
 
 ## 配置与示例
@@ -58,9 +58,9 @@ chmod +x kat-0.6.0-linux-amd64
 - `inbounds`：1–64 个入口；`protocol` 为协议标识，`listen` 为字面 IP 加端口，IPv6 使用 `[::1]:端口`。
 - SOCKS5 的 `users` 使用 `username`/`password`；非回环监听必须配置用户，配置后不回退为无认证。SOCKS5 本身不加密，也不支持 TLS 包装，不应作为未加密的公网服务。
 - Trojan 的 `users` 只使用 `password`，并且必须配置 `tls`。
-- AnyTLS 使用 `anytls.password` 和 `tls`，不填 `users`；`max_sessions`、`max_streams`、`session_streams`、`stream_bytes`、`session_bytes`、`slow_timeout` 限制会话、逻辑流、缓冲和慢消费者。同密码的入口共享身份及预算，冲突配置会被拒绝。
+- AnyTLS 使用 `anytls.password`，不填 `users`。`tls` 可以省略：省略时 Kat 使用每次启动随机生成的自签证书（ECDSA P-256，名称为 `localhost`，只在内存中，不写盘），**客户端必须跳过证书校验**；证书每次重启都会变，无法固定指纹，也无法用 CA 校验，因此不能防范中间人。写了 `tls` 时 `cert` 和 `key` 都必填，`tls` 写成 `null`、`{}` 或缺少其中任一项都会被拒绝。`max_sessions`、`max_streams`、`session_streams`、`stream_bytes`、`session_bytes`、`slow_timeout` 限制会话、逻辑流、缓冲和慢消费者。同密码的入口共享身份及预算，冲突配置会被拒绝。
 - Shadowsocks 使用 `ss.method` 及相应凭据，不填 `users` 或 `tls`。`ss.tcp_salts`、`ss.salts_2017`、`ss.sessions` 控制有界保护状态；填 0 表示默认，不是禁用校验。相同方法和实际密钥的入口共享身份、重放保护及 UDP 关联，保护设置必须一致。
-- `tls.cert`、`tls.key` 指向自行准备的证书和私钥，路径相对启动时的工作目录。Trojan/AnyTLS 入站示例需要先准备 `server.crt` 和 `server.key`；`routing.json` 的 Trojan/AnyTLS 出站用同一份 `server.crt` 作为 `tls.ca`，证书需包含 `localhost`。仓库不附生产证书或私钥。
+- `tls.cert`、`tls.key` 指向自行准备的证书和私钥，路径相对启动时的工作目录。Trojan/AnyTLS 入站示例需要先准备 `server.crt` 和 `server.key`（`anytls-tls.json` 演示的是自备证书写法）；`routing.json` 的 Trojan/AnyTLS 出站用同一份 `server.crt` 作为 `tls.ca`，证书需包含 `localhost`。仓库不附生产证书或私钥。
 - `udp_bind_ipv4`、`udp_bind_ipv6` 可指定直连（direct）UDP 出站的本机源地址；省略时由系统路由选择。它们不是访问控制系统。
 
 `limits` 的常用字段如下；计数或时长填 0/省略一般表示默认，`tcp_idle` 的 0 表示正式支持协议不启用该闲置超时。时长使用 `"5s"`、`"5m"` 等字符串。
@@ -114,7 +114,7 @@ SS 原生 UDP 的闲置按“最后一次合法活动之后”计时：通过认
 - `trojan`：`password`，`tls` 必填（可写 `{}`）。
 - `anytls`：`password`，`tls` 必填；可选 `idle_sessions`（空闲会话池，默认 4，最大 32）与 `idle_timeout`（默认 30s，范围 1s–10m）。UDP 使用 UoT v2。
 - `socks5`：可选 `username` 和 `password`，两者必须同时填写。
-- `tls`：`server_name`、`ca`（PEM 文件）、`pin_sha256`（叶证书 DER 的 SHA-256，64 位十六进制）、`insecure: true`（显式关闭证书校验，不能与 `ca` 或 `pin_sha256` 同时使用）、`alpn`。默认使用系统根证书校验。自签证书请用 `ca` 或 `pin_sha256`，`insecure` 只适合排查问题。
+- `tls`：`server_name`、`ca`（PEM 文件）、`pin_sha256`（叶证书 DER 的 SHA-256，64 位十六进制）、`insecure: true`（显式关闭证书校验，不能与 `ca` 或 `pin_sha256` 同时使用）、`alpn`。默认使用系统根证书校验。自签证书请用 `ca` 或 `pin_sha256`，`insecure` 只适合排查问题；唯一例外是连接省略 `tls` 的 Kat AnyTLS 入站，它的证书每次重启都会变，只能使用 `insecure: true`。
 
 **UDP 能力规则：**
 
@@ -182,9 +182,9 @@ SS 原生 UDP 的闲置按“最后一次合法活动之后”计时：通过认
 
 ## 验证与性能口径
 
-0.6.0 已有普通测试、出站与内核包的竞态检测、`GOOS=windows` 交叉编译，以及真实进程的端到端测试：出站、链式代理、四种策略组的切换与降级、各类规则命中的实际走向，均以 sing-box 1.14.3 和 Kat 自身作为本机上游服务端验证；另做过 2 小时本机回环浸泡。它们不是一般安全审计，也不代表所有发行版、客户端与配置组合均已验证。
+0.6.0 已有普通测试、出站与内核包的竞态检测、`GOOS=windows` 交叉编译，以及真实进程的端到端测试：出站、链式代理、四种策略组的切换与降级、各类规则命中的实际走向，均以 sing-box 1.14.3 和 Kat 自身作为本机上游服务端验证；另做过 2 小时本机回环浸泡。0.6.1 重新运行了全部普通测试、`GOOS=windows` 交叉编译和真实进程端到端测试，并为随机证书模式新增单元测试和真实进程端到端测试（以 Kat 自身的 AnyTLS 出站作为客户端）；竞态检测和回环浸泡没有针对 0.6.1 重做。它们不是一般安全审计，也不代表所有发行版、客户端与配置组合均已验证。
 
-**尚未验证：** Windows 实机运行（只做了交叉编译）；真实 GeoIP 库与公网规则集下载（只用了自制 mmdb 和本机 HTTPS 源）；更长时间运行（只做过 2 小时回环浸泡）；高并发与性能（本版本没有做性能测试）。0.5.20 的静态二进制曾在 Debian 11 / glibc 2.31 完成版本与配置检查，0.6.0 构建方式相同，但没有重复该项检查。
+**尚未验证：** Windows 实机运行（只做了交叉编译）；真实 GeoIP 库与公网规则集下载（只用了自制 mmdb 和本机 HTTPS 源）；更长时间运行（只做过 2 小时回环浸泡）；高并发与性能（本版本没有做性能测试）；随机证书模式只用 Kat 自己的 AnyTLS 出站作为客户端测试过，其他客户端未测试。0.5.20 的静态二进制曾在 Debian 11 / glibc 2.31 完成版本与配置检查，0.6.0、0.6.1 构建方式相同，但没有重复该项检查。
 
 0.5.20 记录的短时性能观察仅对应 Linux 主机的 **2 核 / 4 GiB、总带宽 5G、64 并发、每轮 10 秒并重复 3 次**的特定受限口径，且只涉及入站转发，不代表出站、策略组或规则分流的性能；它不是独立峰值、长期稳定性或生产就绪证明。本版本不作性能领先、长期 SLO 或生产可用性承诺。
 

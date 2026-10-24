@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-const version = "0.6.0"
+const version = "0.6.1"
 
 func execute(args []string) error {
 	if len(args) == 1 && args[0] == "version" {
