@@ -1,1 +1,1 @@
-Kat 0.6.2：默认额度调整，适配真实客户端并发
+Kat 0.6.3：AnyTLS max_sessions 默认跟随 connections

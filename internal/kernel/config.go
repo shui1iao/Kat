@@ -67,6 +67,10 @@ type Inbound struct {
 	// ephemeralTLS: tlsConfig holds a generated in-memory certificate.
 	tlsWritten   bool
 	ephemeralTLS bool
+	// anytlsSessionsAuto is the max_sessions value Validate derived from
+	// limits.connections for an omitted/0 AnyTLS max_sessions (0 = written
+	// explicitly). Like Limits.logicalAuto, re-validation derives it again.
+	anytlsSessionsAuto int
 }
 type Limits struct {
 	LogicalStreams   int      `json:"logical_streams"`
@@ -251,8 +255,19 @@ func (c *Config) Validate() error {
 			if (in.TLS == nil && in.tlsWritten) || len(in.Users) != 0 {
 				return errors.New("AnyTLS requires TLS and single password options")
 			}
-			if e := in.AnyTLS.normalize(); e != nil {
+			// An omitted max_sessions follows limits.connections. While the
+			// options still hold the derived value, re-validation (as Start
+			// does) derives it again from the current connections.
+			if o := in.AnyTLS; o != nil && in.anytlsSessionsAuto != 0 && o.MaxSessions == in.anytlsSessionsAuto {
+				o.MaxSessions = 0
+			}
+			sessionsAuto := in.AnyTLS != nil && in.AnyTLS.MaxSessions == 0
+			in.anytlsSessionsAuto = 0
+			if e := in.AnyTLS.normalize(l.Connections); e != nil {
 				return e
+			}
+			if sessionsAuto {
+				in.anytlsSessionsAuto = in.AnyTLS.MaxSessions
 			}
 		case "shadowsocks":
 			if in.TLS != nil || len(in.Users) != 0 {

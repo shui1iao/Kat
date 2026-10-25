@@ -50,7 +50,7 @@ func TestAnyTLSSlowTimeoutExplicitKept(t *testing.T) {
 		}
 	}
 	for _, bad := range []AnyTLSOptions{{Password: "p", SlowTimeout: Duration(time.Minute + time.Nanosecond)}, {Password: "p", SlowTimeout: Duration(-time.Second)}} {
-		if e := bad.normalize(); e == nil {
+		if e := bad.normalize(defaultConnections); e == nil {
 			t.Fatalf("out-of-range slow_timeout accepted: %v", bad.SlowTimeout.value())
 		}
 	}

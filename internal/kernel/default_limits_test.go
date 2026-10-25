@@ -47,15 +47,16 @@ func TestDefaultLimitsValues(t *testing.T) {
 
 func TestDefaultAnyTLSBudgets(t *testing.T) {
 	o := &AnyTLSOptions{Password: "p"}
-	if e := o.normalize(); e != nil {
+	if e := o.normalize(defaultConnections); e != nil {
 		t.Fatal(e)
 	}
-	if o.MaxSessions != 512 || o.MaxStreams != 4096 || o.SessionStreams != 64 || o.StreamBytes != 131072 || o.SessionBytes != 1048576 || o.SlowTimeout.value().String() != "1m0s" {
+	// max_sessions follows limits.connections (default 4096); see anytls_max_sessions_test.go.
+	if o.MaxSessions != 4096 || o.MaxStreams != 4096 || o.SessionStreams != 64 || o.StreamBytes != 131072 || o.SessionBytes != 1048576 || o.SlowTimeout.value().String() != "1m0s" {
 		t.Fatalf("AnyTLS defaults %+v", *o)
 	}
 	// Hard ranges are unchanged: session_streams <= 64, counts <= 65536.
 	for _, bad := range []AnyTLSOptions{{Password: "p", SessionStreams: 65}, {Password: "p", MaxSessions: 65537}, {Password: "p", MaxStreams: 65537}, {Password: "p", MaxSessions: -1}} {
-		if e := bad.normalize(); e == nil {
+		if e := bad.normalize(defaultConnections); e == nil {
 			t.Fatalf("out-of-range AnyTLS budget accepted: %+v", bad)
 		}
 	}
