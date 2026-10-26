@@ -17,7 +17,7 @@ import (
 // source is one file-backed dataset (a rule set or the GeoIP database) with
 // an optional remote https origin.
 type source struct {
-	kind     string // "rule_set" | "geoip"
+	kind     string // "rule_set" | "geoip" | "geosite" | "asn"
 	name     string // rule set name ("" for geoip)
 	path     string
 	url      string
@@ -25,6 +25,7 @@ type source struct {
 	maxBytes int
 	interval time.Duration
 	mtime    time.Time // of the local file when it loaded successfully
+	stamp    string    // parse parameters, part of the parsed-data cache key
 
 	parse func([]byte) (any, error)
 	check func(any) error // called with Engine.mu held
@@ -44,22 +45,35 @@ const (
 	classTimeout  = "timeout"
 	classNetwork  = "network"
 	classWrite    = "write"
+	classUnsup    = "unsupported"
 )
 
-func (e *Engine) failed(s *source, class string) {
-	if s.kind == "geoip" {
-		e.events.Emit("geoip_update_failed", "class", class)
-		return
+func (e *Engine) failed(s *source, class string) { e.failedDetail(s, class, nil) }
+
+// failedDetail emits the *_update_failed event; unsupported content carries
+// a detail (line or field and the unsupported rule type or option).
+func (e *Engine) failedDetail(s *source, class string, err error) {
+	var kv []string
+	if s.kind == "rule_set" {
+		kv = append(kv, "name", s.name)
 	}
-	e.events.Emit("rule_set_update_failed", "name", s.name, "class", class)
+	kv = append(kv, "class", class)
+	var u *unsupportedError
+	if errors.As(err, &u) {
+		kv = append(kv, "detail", u.msg)
+	}
+	e.events.Emit(s.kind+"_update_failed", kv...)
 }
 
 func dataClass(err error) string {
+	var u *unsupportedError
 	switch {
 	case errors.Is(err, errLimit):
 		return classLimit
 	case errors.Is(err, errTooLarge):
 		return classTooLarge
+	case errors.As(err, &u):
+		return classUnsup
 	}
 	return classParse
 }
@@ -107,14 +121,19 @@ func (e *Engine) loadLocal(s *source) {
 		}
 		return
 	}
-	v, err := s.parse(b)
+	key := cacheKey(s, b)
+	v := cacheGet(s.path, key)
+	if v == nil {
+		v, err = s.parse(b)
+	}
 	if err == nil {
 		err = s.check(v)
 	}
 	if err != nil {
-		e.failed(s, dataClass(err))
+		e.failedDetail(s, dataClass(err), err)
 		return
 	}
+	cachePut(s.path, key, v)
 	s.mtime = fi.ModTime()
 	s.swap(v)
 }
@@ -161,19 +180,20 @@ func (e *Engine) update(ctx context.Context, s *source) bool {
 	}
 	v, err := s.parse(b)
 	if err != nil {
-		e.failed(s, dataClass(err))
+		e.failedDetail(s, dataClass(err), err)
 		return false
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if err := s.check(v); err != nil {
-		e.failed(s, dataClass(err))
+		e.failedDetail(s, dataClass(err), err)
 		return false
 	}
 	if err := writeAtomic(s.path, b); err != nil {
 		e.failed(s, classWrite)
 		return false
 	}
+	cachePut(s.path, cacheKey(s, b), v)
 	s.swap(v)
 	return true
 }
@@ -182,9 +202,16 @@ func writeAtomic(path string, b []byte) (err error) {
 	if err = os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	// A unique temporary name: an engine of a superseded generation may
+	// still be finishing a download of the same source.
+	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp*")
 	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	if err = f.Chmod(0o644); err != nil {
+		f.Close()
+		os.Remove(tmp)
 		return err
 	}
 	defer func() {

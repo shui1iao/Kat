@@ -42,6 +42,13 @@ const (
 	failOutboundDial // proxy outbound/group dial or UDP session setup failed
 	failOutboundUDP  // outbound (or its chain/group) cannot carry UDP
 	failRuleData     // rule set / GeoIP file or download unavailable
+	failBlocked      // destination refused by the security options (loopback/private)
+	failSourceBanned // 0.7.0: source temporarily banned after authentication failures
+	failSourceDenied // source refused by the inbound's source lists
+	failSourceLimit  // source reached security.max_connections_per_ip
+	failFallback     // Trojan fallback address unreachable
+	failBindListen   // SOCKS5 BIND: no free port in the range
+	failBindTimeout  // SOCKS5 BIND: no connection before the timeout
 	failureKinds
 )
 
@@ -57,7 +64,10 @@ var failureLabels = [failureKinds]string{
 	"stage=udp reason=target_limit", "stage=udp reason=socket_io",
 	"stage=udp reason=unauthorized_source_or_expired", "stage=relay reason=stream_io",
 	"stage=outbound reason=proxy_connect_failed", "stage=outbound reason=udp_unsupported",
-	"stage=route reason=rule_data_unavailable",
+	"stage=route reason=rule_data_unavailable", "stage=dial reason=destination_not_allowed",
+	"stage=admission reason=source_banned", "stage=admission reason=source_not_allowed",
+	"stage=admission reason=per_ip_limit", "stage=fallback reason=connect_failed",
+	"stage=bind reason=no_free_port", "stage=bind reason=timeout",
 }
 
 type failureBucket struct {
@@ -69,6 +79,9 @@ type failureLog struct {
 	write   func([]byte) error
 	close   func()
 	once    sync.Once
+	// allow, when set, reports whether the warn level is enabled; disabled
+	// lines neither write nor touch the suppression state.
+	allow func() bool
 }
 
 func newFailureLog() *failureLog {
@@ -80,6 +93,9 @@ func newFailureLog() *failureLog {
 // occurrences are reported on that category's next emission; no timer or worker.
 func (l *failureLog) emit(k failureKind, protocol string, inbound int, now time.Time) {
 	if l == nil || k >= failureKinds {
+		return
+	}
+	if l.allow != nil && !l.allow() {
 		return
 	}
 	b := &l.buckets[k]

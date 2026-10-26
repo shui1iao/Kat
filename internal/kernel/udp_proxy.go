@@ -6,10 +6,12 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/shui1iao/Kat/internal/outbound"
+	"github.com/shui1iao/Kat/internal/stats"
 )
 
 // proxySession is one association's datagram channel through one outbound or
@@ -17,9 +19,12 @@ import (
 // goroutine, recycled after udp_idle without traffic in either direction and
 // closed when the association ends.
 type proxySession struct {
-	name string
-	pc   outbound.PacketConn
-	last atomic.Int64 // unix nanos of the last datagram sent or received
+	name    string
+	pc      outbound.PacketConn
+	last    atomic.Int64 // unix nanos of the last datagram sent or received
+	chain   []string     // outbound chain chosen at creation (name, group members)
+	members sync.Map     // member name -> most recent route for that member
+	route   atomic.Pointer[udpRoute]
 }
 
 func udpUnavailable(e error) bool {
@@ -28,11 +33,26 @@ func udpUnavailable(e error) bool {
 
 // sendProxy forwards one datagram through the named outbound/group. Any
 // failure drops only this datagram (counted and reported by fixed category).
-func (a *udpAssociation) sendProxy(name string, dst Address, payload []byte) {
+func (a *udpAssociation) sendProxy(name string, dst Address, payload []byte, target Address, rule int) {
 	s := a.server
 	ses := a.proxySessionFor(name)
 	if ses == nil {
 		return
+	}
+	chain := ses.chain
+	memberName := ""
+	if pc, ok := ses.pc.(interface{ MemberFor(outbound.Addr) string }); ok {
+		memberName = pc.MemberFor(outbound.Addr{Host: dst.Host, Port: dst.Port})
+		if memberName != "" {
+			chain = append(append([]string(nil), chain...), memberName)
+		}
+	}
+	rt := a.flow.udpDecided(target, rule, chain)
+	if memberName != "" {
+		ses.members.Store(memberName, rt)
+	}
+	if rt != nil {
+		ses.route.Store(rt)
 	}
 	now := time.Now()
 	ses.last.Store(now.UnixNano())
@@ -40,6 +60,10 @@ func (a *udpAssociation) sendProxy(name string, dst Address, payload []byte) {
 	if _, e := ses.pc.WriteTo(payload, outbound.Addr{Host: dst.Host, Port: dst.Port}); e != nil {
 		s.counters.Dropped.Add(1)
 		switch {
+		case blockedError(e):
+			// Only this destination is refused; the session itself is fine.
+			s.failure(failBlocked, "udp", -1)
+			return
 		case udpUnavailable(e):
 			s.failure(failOutboundUDP, "udp", -1)
 		case !quietFailure(e):
@@ -49,6 +73,14 @@ func (a *udpAssociation) sendProxy(name string, dst Address, payload []byte) {
 		a.dropProxy(ses)
 		return
 	}
+	if pc, ok := ses.pc.(interface{ MemberFor(outbound.Addr) string }); ok {
+		if actual := pc.MemberFor(outbound.Addr{Host: dst.Host, Port: dst.Port}); actual != "" && actual != memberName {
+			chain = append(append([]string(nil), ses.chain...), actual)
+			rt = a.flow.udpDecided(target, rule, chain)
+			ses.members.Store(actual, rt)
+		}
+	}
+	a.flow.udpUp(rt, len(payload))
 	if !a.ssNative {
 		a.activity.Store(time.Now().UnixNano())
 	}
@@ -82,7 +114,8 @@ func (a *udpAssociation) proxySessionFor(name string) *proxySession {
 	}
 	l := s.cfg.Limits
 	ctx, cancel := context.WithTimeout(a.ctx, l.DialTimeout.value()+l.HandshakeTimeout.value())
-	pc, e := ob.ListenPacket(ctx)
+	h := &hops{}
+	pc, e := ob.ListenPacket(context.WithValue(ctx, hopsKey{}, h))
 	cancel()
 	if e != nil {
 		s.counters.Dropped.Add(1)
@@ -97,7 +130,7 @@ func (a *udpAssociation) proxySessionFor(name string) *proxySession {
 		}
 		return nil
 	}
-	ses = &proxySession{name: name, pc: pc}
+	ses = &proxySession{name: name, pc: pc, chain: h.chain(name)}
 	ses.last.Store(time.Now().UnixNano())
 	a.mu.Lock()
 	if a.proxyClosed {
@@ -159,6 +192,25 @@ func (a *udpAssociation) proxyReturnLoop(ses *proxySession) {
 			a.cancel()
 			return
 		}
+		rt := ses.route.Load()
+		if pc, ok := ses.pc.(interface{ ReadMember() string }); ok {
+			actual := pc.ReadMember()
+			if v, ok := ses.members.Load(actual); ok {
+				rt, _ = v.(*udpRoute)
+			}
+			// A fast reply from a fallback member can precede WriteTo's return.
+			// Meter the member carried by the datagram, not the previous target.
+			if actual != "" {
+				r := &udpRoute{}
+				if rt != nil && rt.rule != nil {
+					r.rule = rt.rule
+					r.meters = append(r.meters, rt.rule)
+				}
+				r.meters = append(r.meters, sesMemberCounters(a.server, ses.chain, actual)...)
+				rt = r
+			}
+		}
+		a.flow.udpDown(rt, n)
 	}
 }
 
@@ -182,4 +234,8 @@ func (a *udpAssociation) closeProxies() {
 	for _, ses := range list {
 		ses.pc.Close()
 	}
+}
+
+func sesMemberCounters(s *Server, chain []string, member string) []*stats.Counter {
+	return s.chainCounters(append(append([]string(nil), chain...), member))
 }

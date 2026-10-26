@@ -43,10 +43,11 @@ func (s *Server) handleSnell(raw net.Conn, in Inbound, releaseHand func()) {
 		return
 	}
 	defer session.Close()
+	cctx := withInboundMeta(withInbound(withSource(s.ctx, raw.RemoteAddr()), in.logIndex), &in, raw.LocalAddr(), raw.RemoteAddr())
 	first := true
 	for {
 		if !first {
-			if !acquire(s.handSlots) {
+			if !s.handSlots.try() {
 				s.counters.Rejected.Add(1)
 				return
 			}
@@ -58,7 +59,7 @@ func (s *Server) handleSnell(raw net.Conn, in Inbound, releaseHand func()) {
 			releaseHand()
 			first = false
 		} else {
-			<-s.handSlots
+			s.handSlots.release()
 			s.counters.Handshakes.Add(-1)
 		}
 		if e != nil {
@@ -72,27 +73,47 @@ func (s *Server) handleSnell(raw net.Conn, in Inbound, releaseHand func()) {
 				}
 				return q.SendSuccess()
 			}}
+			r.Context = cctx
 			_ = s.serveUDP(raw, r)
 			return
 		}
-		out, e := s.dial(withSource(s.ctx, raw.RemoteAddr()), Address{q.Target.Host, q.Target.Port})
-		if e != nil {
-			_ = q.Reject(1, "destination unavailable")
-			return
-		}
-		if e = q.Approve(); e != nil {
-			out.Close()
-			return
-		}
+		target := Address{q.Target.Host, q.Target.Port}
 		// Snell has real logical CloseWrite. Normal join must not Request.Close():
 		// that would kill the physical session and truncate the reverse direction.
 		stream := &encryptedStream{raw, q}
+		// Sniffing (0.7.0) approves first, like a SOCKS5 reply.
+		sctx, sstream, first, approved, e := s.sniffTCP(cctx, stream, target, q.Approve)
+		if e != nil {
+			return
+		}
+		f, fctx := s.newFlow(sctx, "tcp", target)
+		out, e := s.dial(fctx, target)
+		if e != nil {
+			f.end(dialResult(e))
+			if !approved {
+				_ = q.Reject(1, "destination unavailable")
+			}
+			return
+		}
+		if !approved {
+			if e = q.Approve(); e != nil {
+				out.Close()
+				f.end("ok")
+				return
+			}
+		}
+		if e = forwardSniffed(fctx, out, first); e != nil {
+			out.Close()
+			f.end("ok")
+			return
+		}
 		idle := s.cfg.Limits.TCPIdle.value()
 		if idle == 0 {
 			idle = 5 * time.Minute
 		}
-		e = s.relayIdle(s.ctx, stream, out, idle)
+		e = s.relayIdle(fctx, sstream, out, idle)
 		out.Close()
+		f.end("ok")
 		if e != nil {
 			return
 		}

@@ -61,7 +61,7 @@ func TestSS2017ReplySocketWaitDoesNotBlockRouting(t *testing.T) {
 	defer cancel()
 	s := &Server{}
 	s.cfg.Limits.DialTimeout = Duration(time.Second)
-	n := &ssNativeAssociation{a: &udpAssociation{server: s, ctx: ctx}, runtime: rt, listener: &ssUDPListener{socket: socket, runtime: rt}, capability: udpLockPacket(t, codec, key, peer.LocalAddr().(*net.UDPAddr).AddrPort())}
+	n := &ssNativeAssociation{a: &udpAssociation{server: s, ctx: ctx}, runtime: rt, listener: &ssUDPListener{socket: socket}, capability: udpLockPacket(t, codec, key, peer.LocalAddr().(*net.UDPAddr).AddrPort())}
 	raw, _ := socket.SyscallConn()
 	locked, release, lockDone := make(chan struct{}), make(chan struct{}), make(chan error, 1)
 	var once sync.Once

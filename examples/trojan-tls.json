@@ -1,5 +1,6 @@
 {
   "inbounds":[{"protocol":"trojan","listen":"127.0.0.1:10810","users":[{"password":"replace-with-your-own-password"}],"tls":{"cert":"server.crt","key":"server.key"}}],
   "udp_bind_ipv4":"127.0.0.1", "udp_bind_ipv6":"::1",
+  "security":{"allow_loopback":true},
   "limits":{"connections":64,"handshakes":8,"dials":8,"udp_associations":8,"udp_queue":4,"pool_buffers":16}
 }

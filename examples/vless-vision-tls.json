@@ -1,0 +1,5 @@
+{
+  "inbounds":[{"protocol":"vless","listen":"127.0.0.1:10816","users":[{"uuid":"4a86ae32-2235-4dc3-b103-42a2d162d73c","flow":"xtls-rprx-vision"}],"tls":{"cert":"server.crt","key":"server.key"}}],
+  "udp_bind_ipv4":"127.0.0.1","udp_bind_ipv6":"::1",
+  "limits":{"connections":32,"logical_streams":32,"handshakes":8,"dials":8,"udp_associations":8,"udp_queue":8,"udp_queue_bytes":524056,"udp_targets":8,"pool_buffers":8,"tcp_idle":"5m"}
+}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"github.com/shui1iao/Kat/internal/snell"
 	"github.com/shui1iao/Kat/internal/ss"
+	"reflect"
 	"strings"
 )
 
@@ -111,11 +112,31 @@ func (o *SnellOptions) validate() error {
 	}
 	return nil
 }
-func (s *Server) prepareEncrypted() error {
+
+// prepareEncrypted creates the SS and Snell codecs. A codec of the previous
+// generation with an identical configuration is reused, so replay windows,
+// budgets and SS UDP associations continue across a reload.
+func (s *Server) prepareEncrypted(prev *Server) error {
 	ssByID := map[string]*ssRuntime{}
 	ssOpts := map[string]SSOptions{}
 	snByID := map[[32]byte]*snell.Server{}
 	snOpts := map[[32]byte]SnellOptions{}
+	var prevSS []*ssRuntime
+	type snPrev struct {
+		conf  snell.Config
+		codec *snell.Server
+	}
+	var prevSn []snPrev
+	if prev != nil {
+		for _, in := range prev.cfg.Inbounds {
+			if in.ssRuntime != nil {
+				prevSS = append(prevSS, in.ssRuntime)
+			}
+			if in.snellServer != nil {
+				prevSn = append(prevSn, snPrev{in.snellConf, in.snellServer})
+			}
+		}
+	}
 	for i := range s.cfg.Inbounds {
 		in := &s.cfg.Inbounds[i]
 		if in.Protocol == "shadowsocks" {
@@ -126,11 +147,20 @@ func (s *Server) prepareEncrypted() error {
 			rt := ssByID[id]
 			if rt == nil {
 				key, _ := in.SS.key()
-				codec, e := ss.NewServer(ss.Config{Method: in.SS.Method, Key: key, MaxTCPSalts: in.SS.TCPSalts, Max2017Salts: in.SS.Salts2017, MaxUDPSessions: in.SS.Sessions, UDPIdle: s.cfg.Limits.UDPIdle.value()})
-				if e != nil {
-					return errors.New("cannot initialize SS protection")
+				conf := ss.Config{Method: in.SS.Method, Key: key, MaxTCPSalts: in.SS.TCPSalts, Max2017Salts: in.SS.Salts2017, MaxUDPSessions: in.SS.Sessions, UDPIdle: s.cfg.Limits.UDPIdle.value()}
+				for _, p := range prevSS {
+					if reflect.DeepEqual(p.conf, conf) {
+						rt = p
+						break
+					}
 				}
-				rt = &ssRuntime{codec: codec, v2022: strings.HasPrefix(in.SS.Method, "2022-"), associations: map[ssAssociationID]*ssNativeAssociation{}}
+				if rt == nil {
+					codec, e := ss.NewServer(conf)
+					if e != nil {
+						return errors.New("cannot initialize SS protection")
+					}
+					rt = &ssRuntime{codec: codec, conf: conf, v2022: strings.HasPrefix(in.SS.Method, "2022-"), associations: map[ssAssociationID]*ssNativeAssociation{}}
+				}
 				ssByID[id] = rt
 				ssOpts[id] = *in.SS
 			}
@@ -142,16 +172,26 @@ func (s *Server) prepareEncrypted() error {
 				return errors.New("same Snell PSK requires identical obfs and protection settings")
 			}
 			codec := snByID[id]
+			conf := snell.Config{PSK: []byte(in.Snell.PSK), Obfs: in.Snell.Obfs, MaxSessions: s.cfg.Limits.Connections, MaxRequests: in.Snell.MaxRequests, ReplayCapacity: in.Snell.ReplayCapacity}
+			if codec == nil {
+				for _, p := range prevSn {
+					if reflect.DeepEqual(p.conf, conf) {
+						codec = p.codec
+						break
+					}
+				}
+			}
 			if codec == nil {
 				var e error
-				codec, e = snell.NewServer(snell.Config{PSK: []byte(in.Snell.PSK), Obfs: in.Snell.Obfs, MaxSessions: s.cfg.Limits.Connections, MaxRequests: in.Snell.MaxRequests, ReplayCapacity: in.Snell.ReplayCapacity})
+				codec, e = snell.NewServer(conf)
 				if e != nil {
 					return errors.New("cannot initialize Snell protection")
 				}
-				snByID[id] = codec
-				snOpts[id] = *in.Snell
 			}
+			snByID[id] = codec
+			snOpts[id] = *in.Snell
 			in.snellServer = codec
+			in.snellConf = conf
 		}
 	}
 	return nil

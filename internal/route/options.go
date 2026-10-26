@@ -43,26 +43,44 @@ const (
 )
 
 // Rule is one routing rule: exactly one match field plus exactly one of
-// Action (direct|reject) or Outbound (outbound or group name).
+// Action (direct|reject) or Outbound (outbound or group name). The match
+// field may be a logical and/or/not over sub-conditions; a sub-condition is a
+// Rule with exactly one match field and neither Action nor Outbound.
 type Rule struct {
-	Domain        string `json:"domain,omitempty"`
-	DomainSuffix  string `json:"domain_suffix,omitempty"`
-	DomainKeyword string `json:"domain_keyword,omitempty"`
-	IPCIDR        string `json:"ip_cidr,omitempty"`
-	SrcIPCIDR     string `json:"src_ip_cidr,omitempty"`
-	GeoIP         string `json:"geoip,omitempty"`
-	DstPort       string `json:"dst_port,omitempty"`
-	Network       string `json:"network,omitempty"`
-	RuleSet       string `json:"rule_set,omitempty"`
-	NoResolve     bool   `json:"no_resolve,omitempty"`
-	Action        string `json:"action,omitempty"`
-	Outbound      string `json:"outbound,omitempty"`
+	Domain         string `json:"domain,omitempty"`
+	DomainSuffix   string `json:"domain_suffix,omitempty"`
+	DomainKeyword  string `json:"domain_keyword,omitempty"`
+	DomainRegex    string `json:"domain_regex,omitempty"`
+	DomainWildcard string `json:"domain_wildcard,omitempty"`
+	Geosite        string `json:"geosite,omitempty"`
+	IPCIDR         string `json:"ip_cidr,omitempty"`
+	IPSuffix       string `json:"ip_suffix,omitempty"`
+	IPASN          string `json:"ip_asn,omitempty"`
+	SrcIPCIDR      string `json:"src_ip_cidr,omitempty"`
+	SrcIPASN       string `json:"src_ip_asn,omitempty"`
+	GeoIP          string `json:"geoip,omitempty"`
+	SrcGeoIP       string `json:"src_geoip,omitempty"`
+	DstPort        string `json:"dst_port,omitempty"`
+	SrcPort        string `json:"src_port,omitempty"`
+	InPort         string `json:"in_port,omitempty"`
+	InName         string `json:"in_name,omitempty"`
+	InType         string `json:"in_type,omitempty"`
+	Network        string `json:"network,omitempty"`
+	Protocol       string `json:"protocol,omitempty"`
+	RuleSet        string `json:"rule_set,omitempty"`
+	And            []Rule `json:"and,omitempty"`
+	Or             []Rule `json:"or,omitempty"`
+	Not            *Rule  `json:"not,omitempty"`
+	NoResolve      bool   `json:"no_resolve,omitempty"`
+	Action         string `json:"action,omitempty"`
+	Outbound       string `json:"outbound,omitempty"`
 }
 
-// RuleSetOptions describes one text rule set.
+// RuleSetOptions describes one rule set.
 type RuleSetOptions struct {
 	Name     string            `json:"name"`
 	Format   string            `json:"format"`
+	Behavior string            `json:"behavior,omitempty"`
 	Path     string            `json:"path"`
 	URL      string            `json:"url,omitempty"`
 	Interval outbound.Duration `json:"interval,omitempty"`
@@ -79,12 +97,16 @@ type GeoIPOptions struct {
 	MaxBytes int               `json:"max_bytes,omitempty"`
 }
 
-// Options is the complete routing configuration.
+// Options is the complete routing configuration. Geosite (v2fly geosite.dat)
+// and ASN (MaxMind DB with autonomous_system_number) use the same source
+// fields as GeoIP.
 type Options struct {
 	Rules    []Rule           `json:"rules,omitempty"`
 	Final    string           `json:"final,omitempty"`
 	RuleSets []RuleSetOptions `json:"rule_sets,omitempty"`
 	GeoIP    *GeoIPOptions    `json:"geoip,omitempty"`
+	Geosite  *GeoIPOptions    `json:"geosite,omitempty"`
+	ASN      *GeoIPOptions    `json:"asn,omitempty"`
 }
 
 func errf(format string, a ...any) error { return fmt.Errorf("route: "+format, a...) }
@@ -114,18 +136,21 @@ func (o *Options) Validate() error {
 			return errf("rule_sets[%d]: duplicate name %q", i, s.Name)
 		}
 		sets[s.Name] = true
-		switch s.Format {
-		case "domain", "ipcidr", "classical":
-		default:
-			return errf("rule set %q: format must be domain, ipcidr or classical", s.Name)
+		if e := validateFormat(s); e != nil {
+			return errf("rule set %q: %v", s.Name, e)
 		}
 		if e := validateSource(&s.Path, s.URL, &s.Interval, &s.Via, &s.MaxBytes, defaultSetBytes, maxSetBytes, paths); e != nil {
 			return errf("rule set %q: %v", s.Name, e)
 		}
 	}
-	if g := o.GeoIP; g != nil {
-		if e := validateSource(&g.Path, g.URL, &g.Interval, &g.Via, &g.MaxBytes, defaultGeoBytes, maxGeoBytes, paths); e != nil {
-			return errf("geoip: %v", e)
+	for _, b := range []struct {
+		name string
+		g    *GeoIPOptions
+	}{{"geoip", o.GeoIP}, {"geosite", o.Geosite}, {"asn", o.ASN}} {
+		if g := b.g; g != nil {
+			if e := validateSource(&g.Path, g.URL, &g.Interval, &g.Via, &g.MaxBytes, defaultGeoBytes, maxGeoBytes, paths); e != nil {
+				return errf("%s: %v", b.name, e)
+			}
 		}
 	}
 	for i := range o.Rules {
@@ -143,14 +168,9 @@ func (o *Options) Validate() error {
 }
 
 func (o *Options) validateRule(r *Rule, sets map[string]bool) error {
-	n := 0
-	for _, v := range []string{r.Domain, r.DomainSuffix, r.DomainKeyword, r.IPCIDR, r.SrcIPCIDR, r.GeoIP, r.DstPort, r.Network, r.RuleSet} {
-		if v != "" {
-			n++
-		}
-	}
-	if n != 1 {
-		return errors.New("exactly one match field is required")
+	budget := maxConds
+	if e := o.validateCond(r, sets, 0, &budget); e != nil {
+		return e
 	}
 	if (r.Action == "") == (r.Outbound == "") {
 		return errors.New("exactly one of action or outbound is required")
@@ -166,9 +186,85 @@ func (o *Options) validateRule(r *Rule, sets map[string]bool) error {
 			r.Action, r.Outbound = r.Outbound, ""
 		}
 	}
-	if r.NoResolve && r.IPCIDR == "" && r.GeoIP == "" && r.RuleSet == "" {
-		return errors.New("no_resolve is only allowed with ip_cidr, geoip or rule_set")
+	return nil
+}
+
+// Logical rule limits: nesting depth and conditions per top-level rule.
+const (
+	maxCondDepth = 8
+	maxConds     = 64
+)
+
+func matchFields(r *Rule) int {
+	n := 0
+	for _, v := range []string{r.Domain, r.DomainSuffix, r.DomainKeyword, r.DomainRegex, r.DomainWildcard, r.Geosite, r.IPCIDR, r.IPSuffix, r.IPASN, r.SrcIPCIDR, r.SrcIPASN, r.GeoIP, r.SrcGeoIP, r.DstPort, r.SrcPort, r.InPort, r.InName, r.InType, r.Network, r.Protocol, r.RuleSet} {
+		if v != "" {
+			n++
+		}
 	}
+	if r.And != nil {
+		n++
+	}
+	if r.Or != nil {
+		n++
+	}
+	if r.Not != nil {
+		n++
+	}
+	return n
+}
+
+// validateCond checks and normalizes the match part of r (recursively for
+// logical conditions). Action/Outbound are checked by the caller.
+func (o *Options) validateCond(r *Rule, sets map[string]bool, depth int, budget *int) error {
+	if matchFields(r) != 1 {
+		return errors.New("exactly one match field is required")
+	}
+	if *budget--; *budget < 0 {
+		return fmt.Errorf("too many conditions in one rule (> %d)", maxConds)
+	}
+	if r.NoResolve && r.IPCIDR == "" && r.IPSuffix == "" && r.IPASN == "" && r.GeoIP == "" && r.RuleSet == "" {
+		return errors.New("no_resolve is only allowed with ip_cidr, ip_suffix, ip_asn, geoip or rule_set")
+	}
+	sub := func(list []*Rule, what string) error {
+		if depth+1 > maxCondDepth {
+			return fmt.Errorf("logical rules nested deeper than %d", maxCondDepth)
+		}
+		for i, s := range list {
+			if s.Action != "" || s.Outbound != "" {
+				return fmt.Errorf("%s[%d]: a sub-condition has no action or outbound", what, i)
+			}
+			if e := o.validateCond(s, sets, depth+1, budget); e != nil {
+				return fmt.Errorf("%s[%d]: %w", what, i, e)
+			}
+		}
+		return nil
+	}
+	ptrs := func(l []Rule) []*Rule {
+		out := make([]*Rule, len(l))
+		for i := range l {
+			out[i] = &l[i]
+		}
+		return out
+	}
+	switch {
+	case r.And != nil:
+		if len(r.And) < 2 {
+			return errors.New("and needs at least two conditions")
+		}
+		return sub(ptrs(r.And), "and")
+	case r.Or != nil:
+		if len(r.Or) < 2 {
+			return errors.New("or needs at least two conditions")
+		}
+		return sub(ptrs(r.Or), "or")
+	case r.Not != nil:
+		return sub([]*Rule{r.Not}, "not")
+	}
+	return o.validateLeaf(r, sets)
+}
+
+func (o *Options) validateLeaf(r *Rule, sets map[string]bool) error {
 	switch {
 	case r.Domain != "":
 		d, ok := normDomain(r.Domain)
@@ -206,9 +302,84 @@ func (o *Options) validateRule(r *Rule, sets map[string]bool) error {
 			return errors.New("geoip country rule requires a geoip block")
 		}
 	case r.DstPort != "":
-		if _, _, ok := parsePortRange(r.DstPort); !ok {
-			return errors.New("dst_port must be a port or a range a-b")
+		v, ok := normPorts(r.DstPort)
+		if !ok {
+			return errors.New("dst_port must be a port, a range a-b or a list of them")
 		}
+		r.DstPort = v
+	case r.SrcPort != "":
+		v, ok := normPorts(r.SrcPort)
+		if !ok {
+			return errors.New("src_port must be a port, a range a-b or a list of them")
+		}
+		r.SrcPort = v
+	case r.InPort != "":
+		v, ok := normPorts(r.InPort)
+		if !ok {
+			return errors.New("in_port must be a port, a range a-b or a list of them")
+		}
+		r.InPort = v
+	case r.DomainRegex != "":
+		if _, e := compileDomainRegex(r.DomainRegex); e != nil {
+			return e
+		}
+	case r.DomainWildcard != "":
+		v, ok := normWildcard(r.DomainWildcard)
+		if !ok {
+			return errors.New("invalid domain_wildcard")
+		}
+		r.DomainWildcard = v
+	case r.Geosite != "":
+		v, ok := normGeosite(r.Geosite)
+		if !ok {
+			return errors.New("invalid geosite (category[@attr...])")
+		}
+		r.Geosite = v
+		if o.Geosite == nil {
+			return errors.New("geosite rule requires a geosite block")
+		}
+	case r.IPSuffix != "":
+		if _, ok := parseIPSuffix(r.IPSuffix); !ok {
+			return errors.New("ip_suffix must be ADDRESS/BITS")
+		}
+	case r.IPASN != "" || r.SrcIPASN != "":
+		p := &r.IPASN
+		if *p == "" {
+			p = &r.SrcIPASN
+		}
+		n, ok := parseASN(*p)
+		if !ok {
+			return errors.New("ASN must be a number (optionally prefixed AS)")
+		}
+		*p = strconv.FormatUint(uint64(n), 10)
+		if o.ASN == nil {
+			return errors.New("ASN rule requires an asn block")
+		}
+	case r.SrcGeoIP != "":
+		c, ok := normGeo(r.SrcGeoIP)
+		if !ok {
+			return errors.New("src_geoip must be a two-letter ISO country code or private")
+		}
+		r.SrcGeoIP = c
+		if c != geoPrivate && o.GeoIP == nil {
+			return errors.New("src_geoip country rule requires a geoip block")
+		}
+	case r.InName != "":
+		if !validName(r.InName) {
+			return errors.New("invalid in_name")
+		}
+	case r.InType != "":
+		v, ok := normInType(r.InType)
+		if !ok {
+			return errors.New("in_type must be shadowsocks, anytls, trojan, vless, socks5 or snell")
+		}
+		r.InType = v
+	case r.Protocol != "":
+		v := strings.ToLower(r.Protocol)
+		if v != "tls" && v != "http" && v != "quic" {
+			return errors.New("protocol must be tls, http or quic")
+		}
+		r.Protocol = v
 	case r.Network != "":
 		v := strings.ToLower(r.Network)
 		if v != "tcp" && v != "udp" {

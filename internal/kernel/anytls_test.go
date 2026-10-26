@@ -148,11 +148,11 @@ func TestAnyTLSAuthenticationAndBudgets(t *testing.T) {
 		c.Inbounds = append(c.Inbounds, second)
 	})
 	for range 7 {
-		s.logicalSlots <- struct{}{}
+		s.logicalSlots.try()
 	}
 	defer func() {
 		for range 7 {
-			<-s.logicalSlots
+			s.logicalSlots.release()
 		}
 	}()
 	if s.cfg.Inbounds[0].anytlsServer != s.cfg.Inbounds[1].anytlsServer {
@@ -309,8 +309,8 @@ func TestAnyTLSSlowFlowCancellation(t *testing.T) {
 	in := anyIn(cert)
 	in.AnyTLS.SlowTimeout = Duration(30 * time.Millisecond)
 	s := startTest(t, in, func(c *Config) { c.Limits.Dials = 1; c.Limits.DialTimeout = Duration(time.Second) })
-	s.dialSlots <- struct{}{}
-	defer func() { <-s.dialSlots }()
+	s.dialSlots.try()
+	defer func() { s.dialSlots.release() }()
 	c := atBegin(t, s, pool, 2)
 	atOpen(t, c, 1, Address{"127.0.0.1", 9}, nil)
 	waitFor(t, func() bool { return s.logical.Load() == 1 })

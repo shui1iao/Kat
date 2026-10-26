@@ -98,13 +98,17 @@ func ss2022Ready(c net.Conn) int {
 // target socket already holds, and the result is written in one Write, so the
 // SS2022 writer emits one record of up to ss.MaxChunk2022 payload bytes.
 func (s *Server) copySS2022Down(dst, src net.Conn, target *ss2022DownConn) error {
+	return s.copySS2022DownM(dst, src, target, meter{})
+}
+
+func (s *Server) copySS2022DownM(dst, src net.Conn, target *ss2022DownConn, m meter) error {
 	small := s.pool.get()
 	defer s.pool.put(small)
 	for {
 		// Readv into the existing bounded leases and encrypt them in place.
 		// Unlike the rejected read-first experiment this batches records AND
 		// removes the second writer workspace/copy, without raising any cap.
-		if used, er := trySS2022DownBatch(dst, src, target, len(small)); used {
+		if used, er := trySS2022DownBatchM(dst, src, target, len(small), m); used {
 			if er != nil {
 				if er == io.EOF {
 					return nil
@@ -132,6 +136,7 @@ func (s *Server) copySS2022Down(dst, src net.Conn, target *ss2022DownConn) error
 			if ew == nil && nw != len(buf) {
 				ew = io.ErrShortWrite
 			}
+			m.add(nw)
 			if lease != nil {
 				releaseSS2022Down(lease)
 			}

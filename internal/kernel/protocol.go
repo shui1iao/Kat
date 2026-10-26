@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"io"
 	"net"
@@ -24,6 +23,9 @@ type request struct {
 	Datagrams datagramCodec
 }
 type adapter func(net.Conn, Inbound) (request, error)
+
+// errSOCKSAuth is a wrong SOCKS5 username or password.
+var errSOCKSAuth = errors.New("authentication failed")
 
 var adapters = map[string]adapter{"socks5": parseSOCKS, "trojan": parseTrojan, "vless": parseVLESS}
 
@@ -122,7 +124,7 @@ func parseSOCKS(c net.Conn, in Inbound) (request, error) {
 			return r, e
 		}
 		if match == 0 {
-			return r, errors.New("authentication failed")
+			return r, errSOCKSAuth
 		}
 	}
 	h, e = readN(c, 3)
@@ -133,7 +135,7 @@ func parseSOCKS(c net.Conn, in Inbound) (request, error) {
 		return r, errors.New("invalid SOCKS request")
 	}
 	r.Command = h[1]
-	if r.Command != 1 && r.Command != 3 {
+	if r.Command != 1 && r.Command != 3 && (r.Command != 2 || in.bindOptions() == nil) {
 		_ = writeAll(c, []byte{5, 7, 0, 1, 0, 0, 0, 0, 0, 0})
 		return r, errors.New("unsupported SOCKS command")
 	}
@@ -153,43 +155,6 @@ func expectCRLF(r io.Reader) error {
 		return errors.New("invalid CRLF")
 	}
 	return nil
-}
-func parseTrojan(c net.Conn, in Inbound) (request, error) {
-	r := request{Mode: "trojan", UserIndex: -1, Datagrams: trojanDatagrams{}}
-	b, e := readN(c, 56)
-	if e != nil {
-		return r, e
-	}
-	match := 0
-	for i, u := range in.Users {
-		sum := sha256.Sum224([]byte(u.Password))
-		var encoded [56]byte
-		hex.Encode(encoded[:], sum[:])
-		m := subtle.ConstantTimeCompare(b, encoded[:])
-		match |= m
-		if m == 1 {
-			r.UserIndex = i
-		}
-	}
-	if match == 0 {
-		return r, errors.New("authentication failed")
-	}
-	if e = expectCRLF(c); e != nil {
-		return r, e
-	}
-	v, e := readN(c, 1)
-	if e != nil {
-		return r, e
-	}
-	r.Command = v[0]
-	if r.Command != 1 && r.Command != 3 {
-		return r, errors.New("unsupported Trojan command")
-	}
-	r.Target, e = readAddress(c, false)
-	if e != nil {
-		return r, e
-	}
-	return r, expectCRLF(c)
 }
 func parseVLESS(c net.Conn, in Inbound) (request, error) {
 	r := request{Mode: "vless", UserIndex: -1, Datagrams: vlessDatagrams{}}

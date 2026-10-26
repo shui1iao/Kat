@@ -55,12 +55,12 @@ func (s *Server) handleVLESS(raw net.Conn, in Inbound, releaseHand func()) {
 			if meta.EarlyDataBytes > 0 {
 				s.httpEarly.Add(1)
 			}
-			if !acquire(s.logicalSlots) {
+			if !s.logicalSlots.try() {
 				return errors.New("logical quota")
 			}
 			s.logical.Add(1)
-			defer func() { <-s.logicalSlots; s.logical.Add(-1) }()
-			if !acquire(s.handSlots) {
+			defer func() { s.logicalSlots.release(); s.logical.Add(-1) }()
+			if !s.handSlots.try() {
 				return errors.New("handshake quota")
 			}
 			s.counters.Handshakes.Add(1)
@@ -70,7 +70,7 @@ func (s *Server) handleVLESS(raw net.Conn, in Inbound, releaseHand func()) {
 			if in.Transport.Type == "httpupgrade" {
 				stream = &halfStream{base, st}
 			}
-			return s.vlessRequest(ctx, stream, nil, in, func() { <-s.handSlots; s.counters.Handshakes.Add(-1) }, in.Transport.Type != "httpupgrade")
+			return s.vlessRequest(ctx, stream, nil, in, func() { s.handSlots.release(); s.counters.Handshakes.Add(-1) }, in.Transport.Type != "httpupgrade")
 		})
 		return
 	}
@@ -134,7 +134,7 @@ func acceptVLESSRawTransport(ctx context.Context, raw net.Conn, in Inbound) (net
 }
 
 func (s *Server) vlessRequest(ctx context.Context, c net.Conn, tr *VX.Transport, in Inbound, release func(), fullClose bool) error {
-	ctx = withSource(ctx, c.RemoteAddr()) // src_ip_cidr routing only
+	ctx = withInboundMeta(withInbound(withSource(ctx, c.RemoteAddr()), in.logIndex), &in, c.LocalAddr(), c.RemoteAddr()) // routing, statistics, guard
 	released := false
 	doneHand := func() {
 		if !released {
@@ -167,12 +167,26 @@ func (s *Server) vlessRequest(ctx context.Context, c net.Conn, tr *VX.Transport,
 	doneHand()
 	_ = c.SetDeadline(time.Time{})
 	var out net.Conn
+	var first []byte
 	if q.Command == 1 {
-		out, e = s.dial(ctx, Address{q.Target.Host, q.Target.Port})
+		target := Address{q.Target.Host, q.Target.Port}
+		// Sniffing (0.7.0) reads the plain stream only: not Vision (its padding
+		// is parsed later) and not XHTTP.
+		if q.Flow != VX.VisionFlow && (in.Transport == nil || in.Transport.Type != "xhttp") {
+			ctx, c, first, _, _ = s.sniffTCP(ctx, c, target, nil)
+		}
+		var f *flow
+		f, ctx = s.newFlow(ctx, "tcp", target)
+		out, e = s.dial(ctx, target)
 		if e != nil {
+			f.end(dialResult(e))
 			return e
 		}
+		defer f.end("ok")
 		defer out.Close()
+		if e = forwardSniffed(ctx, out, first); e != nil {
+			return e
+		}
 	}
 	if e = VX.WriteResponse(c); e != nil {
 		return e

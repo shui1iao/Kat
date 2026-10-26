@@ -273,6 +273,7 @@ func TestRoutingCoreInProcessProxy(t *testing.T) {
 	}
 	upCfg := Config{DNS: &DNSOptions{Server: "udp://" + dns.udp.LocalAddr().String()}, UDPBindIPv4: "127.0.0.1", Inbounds: []Inbound{{Protocol: "shadowsocks", Listen: "127.0.0.1:0", SS: ssIn().SS}},
 		Limits: Limits{HandshakeTimeout: Duration(2 * time.Second), DialTimeout: Duration(2 * time.Second), DrainTimeout: Duration(time.Second), UDPIdle: Duration(2 * time.Second)}}
+	upCfg.Security = &SecurityOptions{AllowLoopback: true}
 	up, e := Start(upCfg)
 	if e != nil {
 		t.Fatal(e)
@@ -298,6 +299,7 @@ func TestRoutingCoreInProcessProxy(t *testing.T) {
 			{DomainKeyword: "nope", Action: "reject"},
 		}, Final: "direct"},
 		Limits: Limits{HandshakeTimeout: Duration(2 * time.Second), DialTimeout: Duration(2 * time.Second), DrainTimeout: Duration(time.Second), UDPIdle: Duration(time.Second)}}
+	entryCfg.Security = &SecurityOptions{AllowLoopback: true}
 	entry, e := Start(entryCfg)
 	if e != nil {
 		up.Close(context.Background())

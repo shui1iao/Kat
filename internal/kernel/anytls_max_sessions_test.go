@@ -64,8 +64,8 @@ func TestAnyTLSMaxSessionsFollowsConnections(t *testing.T) {
 		if checked[0] != tc.want || running[0] != tc.want {
 			t.Fatalf("%s: max_sessions check=%d run=%d, want %d", body, checked[0], running[0], tc.want)
 		}
-		if cap(s.connSlots) != tc.want || s.cfg.Limits.LogicalStreams != 8192 {
-			t.Fatalf("%s: connections %d logical_streams %d", body, cap(s.connSlots), s.cfg.Limits.LogicalStreams)
+		if s.connSlots.limit() != tc.want || s.cfg.Limits.LogicalStreams != 8192 {
+			t.Fatalf("%s: connections %d logical_streams %d", body, s.connSlots.limit(), s.cfg.Limits.LogicalStreams)
 		}
 	}
 }

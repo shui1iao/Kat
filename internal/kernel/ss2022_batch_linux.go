@@ -20,6 +20,10 @@ const ss2022BatchRecords = 8
 // 18-byte encrypted length and 16-byte payload tag; no cipher workspace or
 // connection-resident buffer is added. Unknown wrappers/platforms fall back.
 func trySS2022DownBatch(dst, src net.Conn, target *ss2022DownConn, small int) (bool, error) {
+	return trySS2022DownBatchM(dst, src, target, small, meter{})
+}
+
+func trySS2022DownBatchM(dst, src net.Conn, target *ss2022DownConn, small int, m meter) (bool, error) {
 	tcp, ok := target.Conn.(*net.TCPConn)
 	if !ok {
 		return false, nil
@@ -110,6 +114,7 @@ func trySS2022DownBatch(dst, src net.Conn, target *ss2022DownConn, small int) (b
 		used++
 	}
 	nw, ew := codec.Write2022Buffers(wires[:used])
+	m.add(nw)
 	if last != nil && nw > 0 {
 		last.last.Store(time.Now().UnixNano())
 	}

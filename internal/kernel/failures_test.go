@@ -46,7 +46,7 @@ func TestFailureCategoriesBoundedAndPrivate(t *testing.T) {
 }
 func TestFailureClassifiersIgnoreInputsAndNormalEOF(t *testing.T) {
 	var b bytes.Buffer
-	s := &Server{ctx: context.Background(), failures: &failureLog{write: func(p []byte) error { _, e := b.Write(p); return e }}}
+	s := &Server{core: &core{ctx: context.Background(), failures: &failureLog{write: func(p []byte) error { _, e := b.Write(p); return e }}}}
 	for _, e := range []error{nil, io.EOF, net.ErrClosed, context.Canceled} {
 		if !quietFailure(e) {
 			t.Fatal("normal close classified as failure")

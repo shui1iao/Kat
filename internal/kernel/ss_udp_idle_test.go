@@ -213,7 +213,7 @@ func TestSSUDPConfiguredIdleLifecycle(t *testing.T) {
 	target, client, mover, evil := localUDP(t), localUDP(t), localUDP(t), localUDP(t)
 	dst := addrFromNet(target.LocalAddr())
 	endpoint, _ := net.ResolveUDPAddr("udp", s.Addresses()[0].String())
-	rt := s.ssListeners[0].runtime
+	rt := s.ssListeners[0].bind.Load().runtime
 	first := udp2022(t, dst, 91, 1, []byte("initial"))
 	client.WriteToUDP(first, endpoint)
 	p, out := recvUDP(t, target)
@@ -272,7 +272,7 @@ func TestSSUDPConfiguredIdleLifecycle(t *testing.T) {
 	rt.mu.Lock()
 	left := len(rt.associations)
 	rt.mu.Unlock()
-	if left != 0 || len(s.udpSlots) != 0 || n.a.queuedBytes.Load() != 0 {
+	if left != 0 || s.udpSlots.inUse() != 0 || n.a.queuedBytes.Load() != 0 {
 		t.Fatal("idle mapping/slots/queue leaked")
 	}
 	if _, e := n.a.outbound4.WriteToUDPAddrPort(nil, target.LocalAddr().(*net.UDPAddr).AddrPort()); e == nil {

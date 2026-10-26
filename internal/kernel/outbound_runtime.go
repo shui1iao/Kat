@@ -62,6 +62,16 @@ func newProtocolOutbound(o outbound.Options, under outbound.Dialer) (outbound.Ou
 	return nil, fmt.Errorf("outbound %q: unsupported type", o.Name)
 }
 
+// A relay borrows its final clone; routingRuntime owns and closes every clone.
+type relayOutbound struct {
+	outbound.Outbound
+	name string
+}
+
+func (r relayOutbound) Name() string { return r.name }
+func (r relayOutbound) Type() string { return group.TypeRelay }
+func (r relayOutbound) Close() error { return nil }
+
 // lookup is the resolver for Decide and for the direct first hop: Kat's dns
 // settings (system or the configured upstream).
 func (s *Server) lookup(ctx context.Context, host string) ([]netip.Addr, error) {
@@ -84,7 +94,14 @@ func (s *Server) buildRouting() (*routingRuntime, error) {
 	if c.UDPBindIPv6 != "" {
 		b6, _ = netip.ParseAddr(c.UDPBindIPv6)
 	}
-	rt.nodes["direct"] = direct.New(direct.Options{Resolve: s.lookup, BindIPv4: b4.Unmap(), BindIPv6: b6, Timeout: c.Limits.DialTimeout.value()})
+	do := direct.Options{Resolve: s.lookup, BindIPv4: b4.Unmap(), BindIPv6: b6, Timeout: c.Limits.DialTimeout.value()}
+	if s.guardActive() {
+		do.Guard = s.directGuard
+	}
+	if s.directTFO() {
+		do.Control = tfoDialControl
+	}
+	rt.nodes["direct"] = direct.New(do)
 	rt.nodes["reject"] = rejectOutbound{}
 	outs := map[string]outbound.Options{}
 	for _, o := range c.Outbounds {
@@ -100,7 +117,8 @@ func (s *Server) buildRouting() (*routingRuntime, error) {
 			if via == "" {
 				via = "direct"
 			}
-			ob, e := newProtocolOutbound(o, rt.nodes[via])
+			// The server dial of an outbound is not client traffic: no guard, no hop.
+			ob, e := newProtocolOutbound(o, underlay{rt.nodes[via]})
 			if e != nil {
 				rt.close()
 				return nil, e
@@ -110,9 +128,23 @@ func (s *Server) buildRouting() (*routingRuntime, error) {
 			continue
 		}
 		g := groups[name]
+		if g.Type == group.TypeRelay {
+			prev := rt.nodes[g.Members[0]]
+			for _, m := range g.Members[1:] {
+				ob, e := newProtocolOutbound(outs[m], underlay{prev})
+				if e != nil {
+					rt.close()
+					return nil, e
+				}
+				rt.outbounds = append(rt.outbounds, ob)
+				prev = ob
+			}
+			rt.nodes[name] = relayOutbound{Outbound: prev, name: name}
+			continue
+		}
 		members := make([]outbound.Outbound, len(g.Members))
 		for i, m := range g.Members {
-			members[i] = rt.nodes[m]
+			members[i] = member{rt.nodes[m]}
 		}
 		gr, e := group.New(g, members, s.event)
 		if e != nil {
@@ -188,19 +220,17 @@ func (rt *routingRuntime) close() {
 
 // ---- client source address (for src_ip_cidr) ----
 
-type sourceKey struct{}
-
 // withSource attaches the client address to ctx unless one is already set.
 // It is used only for routing decisions and never logged.
 func withSource(ctx context.Context, a net.Addr) context.Context {
-	if _, ok := ctx.Value(sourceKey{}).(netip.Addr); ok {
+	if outbound.SourceFrom(ctx).IsValid() {
 		return ctx
 	}
 	ip := addrIP(a)
 	if !ip.IsValid() {
 		return ctx
 	}
-	return context.WithValue(ctx, sourceKey{}, ip)
+	return outbound.WithSource(ctx, ip)
 }
 func addrIP(a net.Addr) netip.Addr {
 	switch v := a.(type) {
@@ -223,10 +253,7 @@ func addrIP(a net.Addr) netip.Addr {
 	}
 	return ap.Addr().WithZone("").Unmap()
 }
-func sourceOf(ctx context.Context) netip.Addr {
-	ip, _ := ctx.Value(sourceKey{}).(netip.Addr)
-	return ip
-}
+func sourceOf(ctx context.Context) netip.Addr { return outbound.SourceFrom(ctx) }
 
 // ---- routing decisions ----
 
@@ -251,6 +278,16 @@ func (s *Server) decide(ctx context.Context, network string, a Address, src neti
 		return d, "", errors.New("zero destination port")
 	}
 	m := route.Metadata{Network: network, Port: a.Port, Source: src}
+	if im := inboundMetaOf(ctx); im != nil {
+		m.SrcPort, m.InPort, m.InName, m.InType = im.srcPort, im.port, im.name, im.typ
+	}
+	if sn := sniffOf(ctx); sn != nil {
+		m.Protocol = sn.proto
+		a = sn.target(a)
+		if sn.host != "" {
+			m.SniffHost = sn.host
+		}
+	}
 	if ip, e := netip.ParseAddr(a.Host); e == nil {
 		m.IP = ip
 		host = ip.Unmap().String()
@@ -294,11 +331,26 @@ func (s *Server) dialProxy(parent context.Context, start time.Time, name string,
 	l := s.cfg.Limits
 	ctx, cancel := context.WithDeadline(parent, start.Add(l.DialTimeout.value()+l.HandshakeTimeout.value()))
 	defer cancel()
+	h := &hops{}
+	ctx = context.WithValue(ctx, hopsKey{}, h)
 	c, e := s.rt.nodes[name].DialTCP(ctx, outbound.Addr{Host: host, Port: port})
+	if f := flowOf(parent); f != nil {
+		f.mu.Lock()
+		if e == nil {
+			f.chain = h.chain(name)
+		}
+		f.mu.Unlock()
+		if e == nil {
+			// Only the head was metered by route(); add the chosen members.
+			f.meters = append(f.meters, s.chainCounters(f.chain[1:])...)
+		}
+	}
 	if e != nil {
 		switch {
 		case errors.Is(e, outbound.ErrRejected):
 			s.failure(failRoute, "outbound", -1)
+		case blockedError(e):
+			s.failure(failBlocked, "outbound", -1)
 		case parent.Err() != nil:
 		default:
 			s.failure(failOutboundDial, "outbound", -1)
@@ -313,7 +365,9 @@ func (s *Server) dialProxy(parent context.Context, start time.Time, name string,
 // Event lines: "kat event=NAME key=value ... suppressed=N". Only names,
 // counts and classes are ever passed by the emitters (EventSink contract);
 // values are additionally sanitized to one bounded token each.
-var knownEvents = map[string]int{"group_switch": 0, "rule_set_loaded": 1, "rule_set_update_failed": 2, "geoip_loaded": 3, "geoip_update_failed": 4}
+var knownEvents = map[string]int{"group_switch": 0, "rule_set_loaded": 1, "rule_set_update_failed": 2, "geoip_loaded": 3, "geoip_update_failed": 4,
+	// 0.7.0: geosite and ASN databases
+	"geosite_loaded": 5, "geosite_update_failed": 6, "geosite_category_missing": 7, "asn_loaded": 8, "asn_update_failed": 9}
 
 const (
 	eventWindow = 10 * time.Second
@@ -323,8 +377,9 @@ const (
 type eventLog struct {
 	mu      sync.Mutex
 	write   func([]byte) error
+	allow   func(event string) bool // nil = every event; else the log level gate
 	closed  bool
-	buckets [6]struct { // knownEvents + "other"
+	buckets [11]struct { // knownEvents + "other"
 		start      time.Time
 		count      int
 		suppressed uint64
@@ -356,6 +411,9 @@ func (l *eventLog) emit(now time.Time, event string, fields ...string) {
 	if !ok {
 		idx, event = len(knownEvents), "other"
 		fields = nil
+	}
+	if l.allow != nil && !l.allow(event) {
+		return
 	}
 	l.mu.Lock()
 	if l.closed {
@@ -408,9 +466,26 @@ func (l *eventLog) shutdown() {
 	}
 }
 
+// eventLevelOf: update failures are warnings, every other event is info.
+func eventLevelOf(event string) logLevel {
+	if strings.HasSuffix(event, "_failed") {
+		return levelWarn
+	}
+	return levelInfo
+}
+
+// eventLevel extracts the event name of a "kat event=NAME ..." line.
+func eventLevel(line []byte) logLevel {
+	s, _ := strings.CutPrefix(string(line), "kat event=")
+	if i := strings.IndexAny(s, " \n"); i >= 0 {
+		s = s[:i]
+	}
+	return eventLevelOf(s)
+}
+
 // event is the outbound.EventSink handed to groups and the rule engine.
 func (s *Server) event(event string, fields ...string) {
-	if event == "rule_set_update_failed" || event == "geoip_update_failed" {
+	if strings.HasSuffix(event, "_update_failed") {
 		s.failure(failRuleData, "outbound", -1)
 	}
 	s.events.emit(time.Now(), event, fields...)

@@ -1,0 +1,8 @@
+{
+  "inbounds":[{"protocol":"shadowsocks","listen":"127.0.0.1:10816","ss":{"method":"2022-blake3-aes-128-gcm","key":"AAECAwQFBgcICQoLDA0ODw=="}}],
+  "udp_bind_ipv4":"127.0.0.1","udp_bind_ipv6":"::1",
+  "log":{"level":"info","format":"json","file":"/var/log/kat/runtime-example.log","max_size_mb":10,"max_backups":3,"access":true},
+  "stats":{"persist":true,"save_interval":"60s","connections":true},
+  "api":{"listen":"127.0.0.1:10890","secret":"replace-with-a-long-random-secret"},
+  "security":{"allow_loopback":true,"block_private":false}
+}

@@ -1,5 +1,6 @@
 {
   "inbounds":[{"protocol":"shadowsocks","listen":"127.0.0.1:10812","ss":{"method":"aes-128-gcm","password":"replace-with-high-entropy-secret","tcp_salts":4096,"salts_2017":4096,"sessions":128}}],
   "udp_bind_ipv4":"127.0.0.1","udp_bind_ipv6":"::1",
+  "security":{"allow_loopback":true},
   "limits":{"connections":64,"handshakes":8,"dials":8,"udp_associations":8,"udp_queue":4,"udp_queue_bytes":262028,"udp_targets":16,"pool_buffers":16,"tcp_idle":"5m","udp_idle":"60s"}
 }

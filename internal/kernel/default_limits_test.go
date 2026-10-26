@@ -94,7 +94,7 @@ func TestExplicitLimitsKeepWrittenValues(t *testing.T) {
 		if e != nil {
 			t.Fatal(e)
 		}
-		if cap(s.logicalSlots) != tc.want.LogicalStreams || cap(s.connSlots) != tc.want.Connections || cap(s.handSlots) != tc.want.Handshakes || cap(s.dialSlots) != tc.want.Dials || cap(s.udpSlots) != tc.want.UDPAssociations {
+		if s.logicalSlots.limit() != tc.want.LogicalStreams || s.connSlots.limit() != tc.want.Connections || s.handSlots.limit() != tc.want.Handshakes || s.dialSlots.limit() != tc.want.Dials || s.udpSlots.limit() != tc.want.UDPAssociations {
 			t.Fatalf("%s: runtime slots differ from explicit limits", body)
 		}
 		s.Close(context.Background())
@@ -139,8 +139,8 @@ func TestLogicalStreamsAutoCoversAnyTLSIdentities(t *testing.T) {
 		t.Fatal(e)
 	}
 	defer s.Close(context.Background())
-	if cap(s.logicalSlots) != 12288 {
-		t.Fatalf("runtime logical slots %d", cap(s.logicalSlots))
+	if s.logicalSlots.limit() != 12288 {
+		t.Fatalf("runtime logical slots %d", s.logicalSlots.limit())
 	}
 }
 

@@ -36,21 +36,38 @@ func (p *bufferPool) put(b []byte) {
 type readOnly struct{ io.Reader }
 type writeOnly struct{ io.Writer }
 
-func (s *Server) copy(dst, src net.Conn) error {
+func (s *Server) copy(dst, src net.Conn) error { return s.copyM(dst, src, meter{}) }
+
+// spliceChunk bounds one kernel splice while statistics are kept, so that
+// counters and rates advance during long transfers.
+const spliceChunk = 256 << 10
+
+// copyM is copy with payload metering: m counts the bytes written to dst.
+func (s *Server) copyM(dst, src net.Conn, m meter) error {
 	if t, ok := ss2022DownSource(src); ok {
-		return s.copySS2022Down(dst, src, t)
+		return s.copySS2022DownM(dst, src, t, m)
 	}
 	if !s.cfg.Limits.DisableFastPath {
 		if d, ok := dst.(*net.TCPConn); ok {
 			if r, ok := src.(*net.TCPConn); ok {
-				_, e := d.ReadFrom(r)
-				return e
+				if m.f == nil {
+					_, e := d.ReadFrom(r)
+					return e
+				}
+				for {
+					// LimitedReader over a TCPConn keeps the splice path.
+					n, e := d.ReadFrom(&io.LimitedReader{R: r, N: spliceChunk})
+					m.add(int(n))
+					if e != nil || n < spliceChunk {
+						return e
+					}
+				}
 			}
 		}
 	}
 	b := s.pool.get()
 	defer s.pool.put(b)
-	_, e := io.CopyBuffer(writeOnly{dst}, readOnly{src}, b)
+	_, e := io.CopyBuffer(writeOnly{m.writer(dst)}, readOnly{src}, b)
 	return e
 }
 func closeWrite(c net.Conn) error {
@@ -115,15 +132,17 @@ func (s *Server) relayIdle(ctx context.Context, a, b net.Conn, idle time.Duratio
 	}
 
 	done := make(chan error, 2)
-	transfer := func(dst, src net.Conn) {
-		e := s.copy(dst, src)
+	up, down := meters(ctx)
+	transfer := func(dst, src net.Conn, m meter) {
+		e := s.copyM(dst, src, m)
 		if e == nil {
 			e = closeWrite(dst)
 		}
 		done <- e
 	}
-	go transfer(a, b)
-	go transfer(b, a)
+	// a is the client side, b the target: b->a is download, a->b upload.
+	go transfer(a, b, down)
+	go transfer(b, a, up)
 	var err error
 	select {
 	case err = <-done:

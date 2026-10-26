@@ -41,33 +41,34 @@ func (s *Server) routeDirect(name string, ip netip.Addr) bool {
 // original resolve (system DNS, first address). Otherwise it holds one shared
 // dialSlots reservation for the decision (including DNS) and returns either
 // the direct candidates or the outbound name plus normalized host.
-func (s *Server) routeUDP(ctx context.Context, a Address, src netip.Addr) (candidates []netip.AddrPort, proxy, host string, err error) {
+func (s *Server) routeUDP(ctx context.Context, a Address, src netip.Addr) (candidates []netip.AddrPort, proxy, host string, rule int, err error) {
 	if !s.networkPolicy() {
-		ip, e := s.resolve(ctx, a)
+		ip, e := s.resolve(ctx, sniffOf(ctx).target(a))
 		if e != nil {
-			return nil, "", "", e
+			return nil, "", "", 0, e
 		}
-		return []netip.AddrPort{ip}, "", "", nil
+		return []netip.AddrPort{ip}, "", "", 0, nil
 	}
 	ctx, cancel := context.WithTimeout(ctx, s.cfg.Limits.DialTimeout.value())
 	defer cancel()
-	select {
-	case s.dialSlots <- struct{}{}:
-	case <-ctx.Done():
-		return nil, "", "", ctx.Err()
+	if e := s.dialSlots.acquire(ctx); e != nil {
+		return nil, "", "", -1, e
 	}
 	s.counters.Dials.Add(1)
-	defer func() { <-s.dialSlots; s.counters.Dials.Add(-1) }()
+	defer func() { s.dialSlots.release(); s.counters.Dials.Add(-1) }()
 	d, host, e := s.decide(ctx, "udp", a, src)
 	if e != nil {
-		return nil, "", "", e
+		if errors.Is(e, errRouteReject) {
+			return nil, "", "", d.Rule, e
+		}
+		return nil, "", "", -1, e
 	}
 	if d.Kind == route.Proxy {
-		return nil, d.Outbound, host, nil
+		return nil, d.Outbound, host, d.Rule, nil
 	}
 	out := make([]netip.AddrPort, 0, len(d.Candidates))
 	for _, ip := range d.Candidates {
 		out = append(out, netip.AddrPortFrom(ip, a.Port))
 	}
-	return out, "", host, nil
+	return out, "", host, d.Rule, nil
 }

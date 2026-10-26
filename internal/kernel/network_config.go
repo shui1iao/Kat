@@ -10,6 +10,8 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+
+	"github.com/shui1iao/Kat/internal/route"
 )
 
 var errNetworkConfig = errors.New("invalid DNS or routing configuration")
@@ -41,13 +43,43 @@ type RouteRule struct {
 	Action        string `json:"action,omitempty"`
 	Outbound      string `json:"outbound,omitempty"`
 	prefix        netip.Prefix
+	// 0.7.0 conditions (validated by the route package).
+	RouteRuleExt
 }
 
-var routeMatchKeys = []string{"domain", "domain_suffix", "domain_keyword", "ip_cidr", "src_ip_cidr", "geoip", "dst_port", "network", "rule_set"}
+// RouteRuleExt holds the rule conditions added in 0.7.0. Logical and/or/not
+// take sub-conditions: one match field each, no action or outbound.
+type RouteRuleExt struct {
+	DomainRegex    string       `json:"domain_regex,omitempty"`
+	DomainWildcard string       `json:"domain_wildcard,omitempty"`
+	Geosite        string       `json:"geosite,omitempty"`
+	IPSuffix       string       `json:"ip_suffix,omitempty"`
+	IPASN          string       `json:"ip_asn,omitempty"`
+	SrcIPASN       string       `json:"src_ip_asn,omitempty"`
+	SrcGeoIP       string       `json:"src_geoip,omitempty"`
+	SrcPort        string       `json:"src_port,omitempty"`
+	InPort         string       `json:"in_port,omitempty"`
+	InName         string       `json:"in_name,omitempty"`
+	InType         string       `json:"in_type,omitempty"`
+	Protocol       string       `json:"protocol,omitempty"`
+	And            []route.Rule `json:"and,omitempty"`
+	Or             []route.Rule `json:"or,omitempty"`
+	Not            *route.Rule  `json:"not,omitempty"`
+}
+
+var routeMatchKeys = []string{"domain", "domain_suffix", "domain_keyword", "ip_cidr", "src_ip_cidr", "geoip", "dst_port", "network", "rule_set",
+	"domain_regex", "domain_wildcard", "geosite", "ip_suffix", "ip_asn", "src_ip_asn", "src_geoip", "src_port", "in_port", "in_name", "in_type", "protocol"}
+
+// routeLogicKeys take sub-conditions instead of a string.
+var routeLogicKeys = []string{"and", "or", "not"}
 
 // legacy reports whether the rule has the pre-routing-core shape.
 func (r RouteRule) legacy() bool {
-	return r.Outbound == "" && r.DomainKeyword == "" && r.SrcIPCIDR == "" && r.GeoIP == "" && r.DstPort == "" && r.Network == "" && r.RuleSet == "" && !r.NoResolve
+	return r.Outbound == "" && r.DomainKeyword == "" && r.SrcIPCIDR == "" && r.GeoIP == "" && r.DstPort == "" && r.Network == "" && r.RuleSet == "" && !r.NoResolve && r.RouteRuleExt.empty()
+}
+
+func (x *RouteRuleExt) empty() bool {
+	return x.DomainRegex == "" && x.DomainWildcard == "" && x.Geosite == "" && x.IPSuffix == "" && x.IPASN == "" && x.SrcIPASN == "" && x.SrcGeoIP == "" && x.SrcPort == "" && x.InPort == "" && x.InName == "" && x.InType == "" && x.Protocol == "" && x.And == nil && x.Or == nil && x.Not == nil
 }
 
 // All new optional objects reject explicit null, unknown keys and null members.
@@ -74,7 +106,7 @@ func (c *Config) UnmarshalJSON(b []byte) error {
 	if json.Unmarshal(b, &raw) != nil {
 		return errNetworkConfig
 	}
-	for _, k := range []string{"dns", "routing", "outbounds", "groups", "rule_sets", "geoip"} {
+	for _, k := range []string{"dns", "routing", "outbounds", "groups", "providers", "rule_sets", "geoip", "geosite", "asn"} {
 		if v, ok := raw[k]; ok && bytes.Equal(bytes.TrimSpace(v), []byte("null")) {
 			return errNetworkConfig
 		}
@@ -129,6 +161,14 @@ func (o *RouteRule) UnmarshalJSON(b []byte) error {
 			n++
 		}
 	}
+	for _, k := range routeLogicKeys {
+		if v, ok := m[k]; ok {
+			if !strictCondJSON(v) {
+				return errNetworkConfig
+			}
+			n++
+		}
+	}
 	if n != 1 {
 		return errNetworkConfig
 	}
@@ -148,6 +188,16 @@ func (o *RouteRule) UnmarshalJSON(b []byte) error {
 	}
 	*o = RouteRule(p)
 	return nil
+}
+
+// strictCondJSON rejects explicit null and empty strings anywhere inside a
+// logical rule's sub-conditions (the decoder already rejects unknown keys).
+func strictCondJSON(b []byte) bool {
+	var v any
+	if json.Unmarshal(b, &v) != nil || v == nil {
+		return false
+	}
+	return strictTree(v)
 }
 
 func dnsName(s string) (string, error) {

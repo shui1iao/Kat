@@ -3,6 +3,7 @@ package kernel
 import (
 	"context"
 	"errors"
+	"github.com/shui1iao/Kat/internal/outbound"
 	"github.com/shui1iao/Kat/internal/ss"
 	"net"
 	"net/netip"
@@ -18,14 +19,22 @@ type ssAssociationID struct {
 }
 type ssRuntime struct {
 	codec        *ss.Server
+	conf         ss.Config // for reuse by a reload with identical settings
 	v2022        bool
 	mu           sync.Mutex // serializes authenticated migration and reply destination selection
 	associations map[ssAssociationID]*ssNativeAssociation
 }
+
+// ssUDPListener is one SS UDP socket, kept across reloads while its address
+// is configured for a Shadowsocks inbound. bind names the generation, inbound
+// and codec that create new associations; a removed socket is "draining":
+// it only serves associations created on it and closes after the last one.
 type ssUDPListener struct {
-	logIndex int
+	key      string
 	socket   *net.UDPConn
-	runtime  *ssRuntime
+	bind     atomic.Pointer[udpBinding]
+	draining atomic.Bool
+	assocs   atomic.Int64 // live associations created on this socket
 	// Explicit udp_rcvbuf_2017 only: read-back sizes and the bytes still charged
 	// to the process extra socket budget (released exactly once, after close).
 	rcvbufBefore, rcvbufActual int
@@ -42,6 +51,7 @@ type ssNativeAssociation struct {
 	id         ssAssociationID
 	capability *ss.Packet
 	listener   *ssUDPListener
+	origin     *ssUDPListener // socket the association was created on
 }
 
 func (s *Server) listenSSUDP(in Inbound, bound net.Addr) (*ssUDPListener, error) {
@@ -64,7 +74,8 @@ func (s *Server) listenSSUDP(in Inbound, bound net.Addr) (*ssUDPListener, error)
 	if e != nil {
 		return nil, e
 	}
-	l := &ssUDPListener{socket: u, runtime: in.ssRuntime, logIndex: in.logIndex}
+	l := &ssUDPListener{socket: u}
+	l.bind.Store(&udpBinding{g: s, idx: in.logIndex, runtime: in.ssRuntime})
 	if in.SS != nil && in.SS.UDPRcvBuf2017 != 0 {
 		if in.ssRuntime.v2022 {
 			u.Close()
@@ -92,40 +103,43 @@ const ss2017ExtraReadBuffers = 7
 
 var ss2017ReadSlots = make(chan struct{}, ss2017ExtraReadBuffers)
 
-func (s *Server) loopSSUDP(l *ssUDPListener) {
-	defer s.accepts.Done()
+func (k *core) loopSSUDP(l *ssUDPListener) {
+	defer k.accepts.Done()
 	if runtime.GOMAXPROCS(0) > 1 {
 		select {
 		case ss2017ReadSlots <- struct{}{}:
-			s.accepts.Add(1)
-			go func() { defer s.accepts.Done(); defer func() { <-ss2017ReadSlots }(); s.readSSUDP(l) }()
+			k.accepts.Add(1)
+			go func() { defer k.accepts.Done(); defer func() { <-ss2017ReadSlots }(); k.readSSUDP(l) }()
 		default:
 		}
 	}
-	s.readSSUDP(l)
+	k.readSSUDP(l)
 }
-func (s *Server) readSSUDP(l *ssUDPListener) {
+func (k *core) readSSUDP(l *ssUDPListener) {
 	wire := make([]byte, 65535)
 	defer clear(wire)
 	for {
 		n, source, e := l.socket.ReadFromUDPAddrPort(wire)
+		b := l.bind.Load()
+		s := b.g
+		logIndex := b.idx
 		if e != nil {
-			if !quietFailure(e) {
-				s.failure(failUDPIO, "shadowsocks", l.logIndex)
+			if !quietFailure(e) && !l.draining.Load() {
+				s.failure(failUDPIO, "shadowsocks", logIndex)
 			}
 			return
 		}
 		source = netip.AddrPortFrom(source.Addr().Unmap(), source.Port())
-		if n > maxDatagram || !acquire(s.handSlots) {
+		if n > maxDatagram || !s.handSlots.try() {
 			s.counters.Dropped.Add(1)
 			if n > maxDatagram {
-				s.failure(failUDPInvalid, "shadowsocks", l.logIndex)
+				s.failure(failUDPInvalid, "shadowsocks", logIndex)
 			} else {
-				s.failure(failUDPBudget, "shadowsocks", l.logIndex)
+				s.failure(failUDPBudget, "shadowsocks", logIndex)
 			}
 			continue
 		}
-		rt := l.runtime
+		rt := b.runtime
 		// Header parsing and AEAD authentication run outside the routing lock for
 		// both SS2017 and SIP022. The codec itself atomically checks+commits the
 		// replay window, session creation and authenticated-peer migration under
@@ -134,10 +148,10 @@ func (s *Server) readSSUDP(l *ssUDPListener) {
 		// with that codec commit (approved trade-off: concurrent readers may
 		// briefly leave an older listener selected after migration).
 		p, e := rt.codec.DecodeUDP(wire[:n], source)
-		<-s.handSlots
+		s.handSlots.release()
 		if e != nil {
 			s.counters.Dropped.Add(1)
-			s.failure(failUDPInvalid, "shadowsocks", l.logIndex)
+			s.failure(failUDPInvalid, "shadowsocks", logIndex)
 			continue
 		}
 		rt.mu.Lock()
@@ -157,24 +171,49 @@ func (s *Server) readSSUDP(l *ssUDPListener) {
 			assoc = nil
 		}
 		if assoc == nil {
-			if !acquire(s.udpSlots) {
+			// A new association belongs to the generation bound right now; a
+			// removed (draining) socket accepts no new association.
+			if s.udpSourceRefused(source.Addr(), logIndex) {
 				rt.mu.Unlock()
 				s.counters.Dropped.Add(1)
-				s.failure(failUDPBudget, "shadowsocks", l.logIndex)
 				continue
 			}
-			ctx, cancel := context.WithCancel(s.nativeContext)
-			a := &udpAssociation{server: s, ctx: ctx, cancel: cancel, ssNative: true, queue: make(chan packet, s.cfg.Limits.UDPQueue), allowed: map[netip.AddrPort]time.Time{}, source: source.Addr()}
-			if e = a.openOutbound(); e != nil {
-				cancel()
-				<-s.udpSlots
+			k.bindMu.RLock()
+			ok := !l.draining.Load() && l.bind.Load() == b
+			if ok {
+				s.refs.Add(1)
+			}
+			k.bindMu.RUnlock()
+			if !ok {
 				rt.mu.Unlock()
 				s.counters.Dropped.Add(1)
-				s.failure(failUDPIO, "shadowsocks", l.logIndex)
+				continue
+			}
+			if !s.udpSlots.try() {
+				rt.mu.Unlock()
+				s.counters.Dropped.Add(1)
+				s.failure(failUDPBudget, "shadowsocks", logIndex)
+				s.unref()
+				continue
+			}
+			base := withInbound(outbound.WithSource(s.nativeContext, source.Addr()), logIndex)
+			base = withInboundMeta(base, &s.cfg.Inbounds[logIndex], l.socket.LocalAddr(), net.UDPAddrFromAddrPort(source))
+			f, fctx := s.newFlow(base, "udp", Address{})
+			ctx, cancel := context.WithCancel(fctx)
+			a := &udpAssociation{server: s, ctx: ctx, cancel: cancel, ssNative: true, queue: make(chan packet, s.cfg.Limits.UDPQueue), allowed: map[netip.AddrPort]time.Time{}, source: source.Addr(), flow: f}
+			if e = a.openOutbound(); e != nil {
+				cancel()
+				f.end("udp_socket_failed")
+				s.udpSlots.release()
+				rt.mu.Unlock()
+				s.counters.Dropped.Add(1)
+				s.failure(failUDPIO, "shadowsocks", logIndex)
+				s.unref()
 				continue
 			}
 			a.activity.Store(p.AuthenticatedAt().UnixNano())
-			assoc = &ssNativeAssociation{a: a, runtime: rt, id: id}
+			assoc = &ssNativeAssociation{a: a, runtime: rt, id: id, origin: l}
+			l.assocs.Add(1)
 			a.writeBack = assoc.reply
 			rt.associations[id] = assoc
 			s.counters.UDP.Add(1)
@@ -215,6 +254,7 @@ func (s *Server) runSSAssociation(n *ssNativeAssociation) {
 	defer func() {
 		a.cancel()
 		a.closeOutbound()
+		a.flow.end("ok")
 		n.runtime.mu.Lock()
 		if n.runtime.associations[n.id] == n {
 			delete(n.runtime.associations, n.id)
@@ -226,7 +266,17 @@ func (s *Server) runSSAssociation(n *ssNativeAssociation) {
 				a.queuedBytes.Add(-int64(len(p.payload)))
 			default:
 				s.counters.UDP.Add(-1)
-				<-s.udpSlots
+				s.udpSlots.release()
+				// The association no longer uses its socket (a removed
+				// inbound's socket closes with its last association) nor
+				// its generation.
+				if n.origin != nil {
+					n.origin.assocs.Add(-1)
+					if s.core != nil {
+						s.closeIfDrained(n.origin)
+					}
+				}
+				s.unref()
 				s.wg.Done()
 				return
 			}

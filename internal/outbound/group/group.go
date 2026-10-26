@@ -1,5 +1,6 @@
-// Package group implements Kat's policy groups: select, url-test, fallback and
-// smart. A group is itself an outbound.Outbound, so groups can be nested and
+// Package group implements Kat's policy groups: select, url-test, fallback,
+// smart and load-balance (relay groups are expanded by the kernel into via
+// chains and never reach this package at run time). A group is itself an outbound.Outbound, so groups can be nested and
 // used as the "via" hop of a protocol outbound.
 //
 // The smart group is Kat's own design. Its inputs and parameters were chosen
@@ -19,6 +20,7 @@ import (
 	"math"
 	"net/netip"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -32,11 +34,29 @@ const (
 	TypeURLTest  = "url-test"
 	TypeFallback = "fallback"
 	TypeSmart    = "smart"
+	// TypeLoadBalance spreads connections over the healthy members.
+	TypeLoadBalance = "load-balance"
+	// TypeRelay chains its members (first = closest to Kat). The kernel turns
+	// it into the equivalent via chain; New refuses it.
+	TypeRelay = "relay"
+)
+
+// Load-balance strategies.
+const (
+	StrategyRoundRobin        = "round-robin"
+	StrategyConsistentHashing = "consistent-hashing"
+	StrategyStickySessions    = "sticky-sessions"
 )
 
 // Fixed parameters (design constants; not configurable).
 const (
-	maxMembers           = 64
+	maxMembers           = 64   // explicitly written members
+	maxExpandedMembers   = 1024 // after provider/include_all expansion
+	maxRelayMembers      = 4
+	defaultStickyTTL     = 10 * time.Minute
+	maxStickyTTL         = 24 * time.Hour
+	maxFailedTimesLimit  = 100
+	lbDefaultMaxFailed   = 5
 	maxAttempts          = 3 // members tried per connection before giving up
 	probeConcurrency     = 4
 	defaultInterval      = 10 * time.Minute // url-test / fallback
@@ -58,17 +78,48 @@ type ProbeOptions struct {
 	URL      string            `json:"url"`                // required (http/https); no built-in default
 	Interval outbound.Duration `json:"interval,omitempty"` // url-test/fallback default 10m; smart default 5m
 	Timeout  outbound.Duration `json:"timeout,omitempty"`  // default 5s, max 60s
+	// ExpectedStatus restricts the HTTP statuses that count as success:
+	// "204", "200/204", "200-299/302" or "*". Empty = any status below 500.
+	ExpectedStatus string `json:"expected_status,omitempty"`
 }
 
 // Options is one entry of the root "groups" array.
 type Options struct {
 	Name      string             `json:"name"`
 	Type      string             `json:"type"`                // select | url-test | fallback | smart
-	Members   []string           `json:"members"`             // 1..64, unique
+	Members   []string           `json:"members,omitempty"`   // 1..64, unique
 	Selected  string             `json:"selected,omitempty"`  // select only
 	Probe     *ProbeOptions      `json:"probe,omitempty"`     // required for url-test/fallback/smart, forbidden for select
 	Tolerance outbound.Duration  `json:"tolerance,omitempty"` // url-test only, default 100ms
 	Priority  map[string]float64 `json:"priority,omitempty"`  // smart only; member name -> (0, 100], default 1
+
+	// load-balance only.
+	Strategy  string            `json:"strategy,omitempty"`   // round-robin | consistent-hashing (default) | sticky-sessions
+	StickyTTL outbound.Duration `json:"sticky_ttl,omitempty"` // sticky-sessions, default 10m
+
+	// Health checking (url-test, fallback, smart, load-balance).
+	Lazy           *bool `json:"lazy,omitempty"`             // probe only while the group is used (default true; smart default: probe from start)
+	MaxFailedTimes int   `json:"max_failed_times,omitempty"` // real failures that trigger a re-test / mark a member down
+
+	// Dynamic members (expanded by the kernel; never valid for relay).
+	Use                 []string `json:"use,omitempty"`    // provider names
+	Filter              string   `json:"filter,omitempty"` // RE2 on member names; ` separates alternatives
+	ExcludeFilter       string   `json:"exclude_filter,omitempty"`
+	ExcludeType         string   `json:"exclude_type,omitempty"` // e.g. "shadowsocks|socks5"
+	IncludeAll          bool     `json:"include_all,omitempty"`
+	IncludeAllProxies   bool     `json:"include_all_proxies,omitempty"`
+	IncludeAllProviders bool     `json:"include_all_providers,omitempty"`
+
+	// Set by the kernel when Members holds the expanded member list.
+	Expanded bool `json:"-"`
+	// ConfigDefault is the configured default of an expanded select group:
+	// selected, else the first written member, else "" (first available).
+	ConfigDefault string `json:"-"`
+}
+
+// Dynamic reports whether the group takes members from providers or include_all*.
+func (o Options) Dynamic() bool {
+	return len(o.Use) > 0 || o.IncludeAll || o.IncludeAllProxies || o.IncludeAllProviders
 }
 
 // Group is a policy group. It is an outbound.Outbound itself.
@@ -139,6 +190,12 @@ type config struct {
 	timeout   time.Duration
 	tolerance time.Duration
 	priority  []float64
+
+	strategy  string
+	stickyTTL time.Duration
+	lazy      bool
+	maxFailed int
+	expected  func(int) bool // nil: status < 500
 }
 
 func normalize(o Options) (config, error) {
@@ -150,12 +207,35 @@ func normalize(o Options) (config, error) {
 		return fail("name is required")
 	}
 	switch o.Type {
-	case TypeSelect, TypeURLTest, TypeFallback, TypeSmart:
+	case TypeSelect, TypeURLTest, TypeFallback, TypeSmart, TypeLoadBalance:
+	case TypeRelay:
+		return normalizeRelay(o, fail)
 	default:
 		return fail("unknown type %q", o.Type)
 	}
-	if len(o.Members) == 0 || len(o.Members) > maxMembers {
-		return fail("members must have 1..%d entries", maxMembers)
+	dynamic := o.Dynamic()
+	limit := maxMembers
+	if o.Expanded {
+		limit = maxExpandedMembers
+	}
+	if len(o.Members) > limit || (len(o.Members) == 0 && !dynamic) {
+		if dynamic {
+			return fail("members must have at most %d entries", limit)
+		}
+		return fail("members must have 1..%d entries", limit)
+	}
+	if _, err := memberFilter(o); err != nil {
+		return fail("%v", err)
+	}
+	if !dynamic && (o.Filter != "" || o.ExcludeFilter != "" || o.ExcludeType != "") {
+		return fail("filter, exclude_filter and exclude_type need use or include_all*")
+	}
+	seenUse := map[string]bool{}
+	for _, u := range o.Use {
+		if u == "" || seenUse[u] {
+			return fail("empty or duplicate provider in use")
+		}
+		seenUse[u] = true
 	}
 	index := make(map[string]int, len(o.Members))
 	for i, m := range o.Members {
@@ -179,7 +259,8 @@ func normalize(o Options) (config, error) {
 			return fail("selected is only valid for select groups")
 		}
 		i, ok := index[o.Selected]
-		if !ok {
+		// A dynamic group may name a provider node that is resolved later.
+		if !ok && (o.Expanded || !dynamic) {
 			return fail("selected %q is not a member", o.Selected)
 		}
 		c.selected = i
@@ -193,9 +274,15 @@ func normalize(o Options) (config, error) {
 	if len(o.Priority) != 0 && o.Type != TypeSmart {
 		return fail("priority is only valid for smart groups")
 	}
+	if (o.Strategy != "" || o.StickyTTL != 0) && o.Type != TypeLoadBalance {
+		return fail("strategy and sticky_ttl are only valid for load-balance groups")
+	}
 	if o.Type == TypeSelect {
 		if o.Probe != nil {
 			return fail("probe is not valid for select groups")
+		}
+		if o.Lazy != nil || o.MaxFailedTimes != 0 {
+			return fail("lazy and max_failed_times are not valid for select groups")
 		}
 		return c, nil
 	}
@@ -245,10 +332,62 @@ func normalize(o Options) (config, error) {
 	case c.timeout == 0:
 		c.timeout = defaultTimeout
 	}
+	if o.Probe.ExpectedStatus != "" {
+		f, e := parseExpectedStatus(o.Probe.ExpectedStatus)
+		if e != nil {
+			return fail("probe.expected_status: %v", e)
+		}
+		c.expected = f
+	}
+	// lazy: url-test, fallback and load-balance default to probing only
+	// while used (their previous behaviour); smart defaults to probing from
+	// Start and pausing when idle.
+	c.lazy = o.Type != TypeSmart
+	if o.Lazy != nil {
+		c.lazy = *o.Lazy
+	}
+	switch o.Type {
+	case TypeURLTest:
+		c.maxFailed = urlTestFailCount
+	case TypeFallback:
+		c.maxFailed = fallbackFailLimit
+	case TypeLoadBalance:
+		c.maxFailed = lbDefaultMaxFailed
+	case TypeSmart:
+		if o.MaxFailedTimes != 0 {
+			return fail("max_failed_times is not valid for smart groups (fixed penalty model)")
+		}
+	}
+	if o.MaxFailedTimes != 0 {
+		if o.MaxFailedTimes < 1 || o.MaxFailedTimes > maxFailedTimesLimit {
+			return fail("max_failed_times must be 1..%d", maxFailedTimesLimit)
+		}
+		c.maxFailed = o.MaxFailedTimes
+	}
 	if o.Type == TypeURLTest {
 		c.tolerance = o.Tolerance.Value()
 		if c.tolerance == 0 {
 			c.tolerance = defaultTolerance
+		}
+	}
+	if o.Type == TypeLoadBalance {
+		c.strategy = o.Strategy
+		switch c.strategy {
+		case "":
+			c.strategy = StrategyConsistentHashing
+		case StrategyRoundRobin, StrategyConsistentHashing, StrategyStickySessions:
+		default:
+			return fail("unknown strategy %q", o.Strategy)
+		}
+		if o.StickyTTL != 0 && c.strategy != StrategyStickySessions {
+			return fail("sticky_ttl is only valid with strategy sticky-sessions")
+		}
+		c.stickyTTL = o.StickyTTL.Value()
+		switch {
+		case c.stickyTTL == 0:
+			c.stickyTTL = defaultStickyTTL
+		case c.stickyTTL < time.Second || c.stickyTTL > maxStickyTTL:
+			return fail("sticky_ttl must be between 1s and %s", maxStickyTTL)
 		}
 	}
 	if o.Type == TypeSmart {
@@ -258,16 +397,149 @@ func normalize(o Options) (config, error) {
 		}
 		for name, v := range o.Priority {
 			i, ok := index[name]
-			if !ok {
-				return fail("priority refers to unknown member %q", name)
-			}
 			if math.IsNaN(v) || v <= 0 || v > maxPriority {
 				return fail("priority for %q must be in (0, %d]", name, maxPriority)
+			}
+			if !ok {
+				if dynamic {
+					continue // may name a provider node absent from this expansion
+				}
+				return fail("priority refers to unknown member %q", name)
 			}
 			c.priority[i] = v
 		}
 	}
 	return c, nil
+}
+
+// normalizeRelay checks a relay group: 1..4 written members, nothing else.
+func normalizeRelay(o Options, fail func(string, ...any) (config, error)) (config, error) {
+	if o.Dynamic() || o.Filter != "" || o.ExcludeFilter != "" || o.ExcludeType != "" {
+		return fail("relay members must be written explicitly (no use, filter or include_all*)")
+	}
+	if o.Selected != "" || o.Probe != nil || o.Tolerance != 0 || len(o.Priority) != 0 || o.Strategy != "" || o.StickyTTL != 0 || o.Lazy != nil || o.MaxFailedTimes != 0 {
+		return fail("relay groups take only name, type and members")
+	}
+	if len(o.Members) == 0 || len(o.Members) > maxRelayMembers {
+		return fail("relay members must have 1..%d entries", maxRelayMembers)
+	}
+	seen := map[string]bool{}
+	for _, m := range o.Members {
+		if m == "" || m == o.Name || seen[m] {
+			return fail("empty, duplicate or self relay member")
+		}
+		if m == "direct" || m == "reject" {
+			return fail("relay members must be outbounds or groups, not %s", m)
+		}
+		seen[m] = true
+	}
+	return config{name: o.Name, kind: TypeRelay, members: append([]string(nil), o.Members...)}, nil
+}
+
+// parseExpectedStatus parses "*", "204", "200/204" and ranges "200-299".
+func parseExpectedStatus(s string) (func(int) bool, error) {
+	s = strings.TrimSpace(s)
+	if s == "*" {
+		return func(int) bool { return true }, nil
+	}
+	type span struct{ lo, hi int }
+	var spans []span
+	for _, part := range strings.Split(s, "/") {
+		part = strings.TrimSpace(part)
+		lo, hi, isRange := strings.Cut(part, "-")
+		a, e1 := strconv.Atoi(strings.TrimSpace(lo))
+		b := a
+		var e2 error
+		if isRange {
+			b, e2 = strconv.Atoi(strings.TrimSpace(hi))
+		}
+		if e1 != nil || e2 != nil || a < 100 || b > 599 || a > b {
+			return nil, fmt.Errorf("invalid status %q (use 204, 200/204, 200-299 or *)", part)
+		}
+		spans = append(spans, span{a, b})
+		if len(spans) > 32 {
+			return nil, errors.New("too many status entries")
+		}
+	}
+	return func(code int) bool {
+		for _, sp := range spans {
+			if code >= sp.lo && code <= sp.hi {
+				return true
+			}
+		}
+		return false
+	}, nil
+}
+
+// MemberFilter returns the predicate a dynamic member (name, Kat outbound
+// type) must satisfy to join group o: filter (any alternative matches, when
+// set), no exclude_filter alternative matches, type not in exclude_type.
+// Written members are never filtered.
+func MemberFilter(o Options) (func(name, typ string) bool, error) { return memberFilter(o) }
+
+func memberFilter(o Options) (func(name, typ string) bool, error) {
+	compile := func(field, s string) ([]*regexp.Regexp, error) {
+		if s == "" {
+			return nil, nil
+		}
+		var out []*regexp.Regexp
+		for _, p := range strings.Split(s, "`") {
+			if p == "" {
+				continue
+			}
+			re, e := regexp.Compile(p)
+			if e != nil {
+				return nil, fmt.Errorf("%s: invalid regular expression %q (RE2 syntax; look-around is not supported)", field, p)
+			}
+			out = append(out, re)
+		}
+		return out, nil
+	}
+	inc, e := compile("filter", o.Filter)
+	if e != nil {
+		return nil, e
+	}
+	exc, e := compile("exclude_filter", o.ExcludeFilter)
+	if e != nil {
+		return nil, e
+	}
+	types := map[string]bool{}
+	if o.ExcludeType != "" {
+		for _, t := range strings.Split(o.ExcludeType, "|") {
+			t = strings.ToLower(strings.TrimSpace(t))
+			switch t {
+			case "ss":
+				t = "shadowsocks"
+			case "socks":
+				t = "socks5"
+			}
+			switch t {
+			case "shadowsocks", "socks5", "trojan", "anytls":
+			default:
+				return nil, fmt.Errorf("exclude_type: unknown type %q (shadowsocks|ss, socks5|socks, trojan, anytls)", t)
+			}
+			types[t] = true
+		}
+	}
+	return func(name, typ string) bool {
+		if types[typ] {
+			return false
+		}
+		for _, re := range exc {
+			if re.MatchString(name) {
+				return false
+			}
+		}
+		if len(inc) == 0 {
+			return true
+		}
+		for _, re := range inc {
+			if re.MatchString(name) {
+				return true
+			}
+		}
+		return false
+	}, nil
 }
 
 // New builds a group. members must be the resolved outbounds for o.Members,
@@ -289,6 +561,9 @@ func newGroup(o Options, members []outbound.Outbound, events outbound.EventSink,
 	if err != nil {
 		return nil, err
 	}
+	if c.kind == TypeRelay {
+		return nil, fmt.Errorf("group %q: relay groups are built by the kernel as via chains", c.name)
+	}
 	if len(members) != len(c.members) {
 		return nil, fmt.Errorf("group %q: got %d member outbounds for %d member names", c.name, len(members), len(c.members))
 	}
@@ -307,11 +582,15 @@ func newGroup(o Options, members []outbound.Outbound, events outbound.EventSink,
 	if h.clk == nil {
 		h.clk = realClock{}
 	}
+	if len(ms) == 0 {
+		// A dynamic group whose providers/filters currently yield nothing.
+		return &emptyGroup{cfg: c}, nil
+	}
 	if c.kind == TypeSelect {
 		return &selectGroup{cfg: c, members: ms, events: events, sel: c.selected}, nil
 	}
 	if h.probe == nil {
-		h.probe = (&httpProber{url: c.url, target: c.target, tls: h.tls, clk: h.clk}).probe
+		h.probe = (&httpProber{url: c.url, target: c.target, tls: h.tls, clk: h.clk, expected: c.expected}).probe
 	}
 	return newAutoGroup(c, ms, events, h), nil
 }

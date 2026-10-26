@@ -17,7 +17,9 @@ func (w anyTLSUpReadActivity) Write(p []byte) (int, error) {
 	w.last.Store(time.Now().UnixNano())
 	return w.Writer.Write(p)
 }
-func (s *Server) copyAnyTLSUp(dst, src net.Conn) error {
+func (s *Server) copyAnyTLSUp(dst, src net.Conn) error { return s.copyAnyTLSUpM(dst, src, meter{}) }
+
+func (s *Server) copyAnyTLSUpM(dst, src net.Conn, m meter) error {
 	raw := src
 	var target io.Writer = dst
 	if activity, ok := src.(*activityStream); ok {
@@ -25,8 +27,8 @@ func (s *Server) copyAnyTLSUp(dst, src net.Conn) error {
 		target = anyTLSUpReadActivity{dst, activity.last}
 	}
 	if stream, ok := raw.(*anyStream); ok {
-		_, err := stream.st.WriteTCPTo(target)
+		_, err := stream.st.WriteTCPTo(m.writer(target))
 		return err
 	}
-	return s.copy(dst, src)
+	return s.copyM(dst, src, m)
 }

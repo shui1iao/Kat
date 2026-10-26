@@ -1,0 +1,5 @@
+{
+  "inbounds":[{"protocol":"vless","listen":"127.0.0.1:10809","users":[{"uuid":"4a86ae32-2235-4dc3-b103-42a2d162d73c"}]}],
+  "udp_bind_ipv4":"127.0.0.1", "udp_bind_ipv6":"::1",
+  "limits":{"connections":64,"handshakes":8,"dials":8,"udp_associations":8,"udp_queue":4,"pool_buffers":16}
+}

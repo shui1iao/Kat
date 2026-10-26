@@ -1,1 +1,1 @@
-Kat 0.6.3：AnyTLS max_sessions 默认跟随 connections
+Kat 0.7.0：热重载、自动证书、规则嗅探与动态策略组

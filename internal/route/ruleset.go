@@ -1,13 +1,10 @@
 package route
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"net/netip"
 	"slices"
-	"strings"
-	"unicode/utf8"
 )
 
 var (
@@ -153,239 +150,17 @@ func (s *ipSet) contains(ip netip.Addr) bool {
 	return lo > 0 && !s.v6[lo-1].hi.less(x)
 }
 
-// ---- domains: exact and suffix maps (label-suffix walk), keywords linear ----
-
-type domainSet struct {
-	exact, suffix map[string]struct{}
-	keywords      []string
-}
-
-func (d *domainSet) match(host string) bool {
-	if host == "" {
+// addRange adds an arbitrary inclusive range of one family (binary formats).
+func (s *ipSet) addRange(lo, hi netip.Addr) bool {
+	lo, hi = lo.Unmap(), hi.Unmap()
+	if !lo.IsValid() || lo.Is4() != hi.Is4() || hi.Less(lo) {
 		return false
 	}
-	if _, ok := d.exact[host]; ok {
+	if lo.Is4() {
+		a, b := lo.As4(), hi.As4()
+		s.v4 = append(s.v4, r4{binary.BigEndian.Uint32(a[:]), binary.BigEndian.Uint32(b[:])})
 		return true
 	}
-	if len(d.suffix) > 0 {
-		for s := host; ; {
-			if _, ok := d.suffix[s]; ok {
-				return true
-			}
-			i := strings.IndexByte(s, '.')
-			if i < 0 {
-				break
-			}
-			s = s[i+1:]
-		}
-	}
-	for _, k := range d.keywords {
-		if strings.Contains(host, k) {
-			return true
-		}
-	}
-	return false
-}
-
-type portRange struct{ lo, hi uint16 }
-
-func portIn(ps []portRange, p uint16) bool {
-	for _, r := range ps {
-		if p >= r.lo && p <= r.hi {
-			return true
-		}
-	}
-	return false
-}
-
-// setData is an immutable parsed rule set (swapped atomically on update).
-type setData struct {
-	dom   domainSet
-	ports []portRange
-	ip    ipSet    // IP entries that may trigger resolution
-	ipNR  ipSet    // IP entries marked no-resolve (only match when an IP is known)
-	geo   []string // GEOIP entries that may trigger resolution
-	geoNR []string
-	// entries/skipped are reported in rule_set_loaded.
-	entries, skipped int
-}
-
-func (d *setData) matchStatic(host string, port uint16) bool {
-	return d.dom.match(host) || portIn(d.ports, port)
-}
-
-// ---- parsing ----
-
-// parseRuleSet parses a text rule set. Unsupported or malformed lines are
-// skipped and counted; the whole content fails only when it is not text, has
-// more than limit entries, or contains malformed lines and no valid entry.
-func parseRuleSet(format string, b []byte, limit int) (*setData, error) {
-	b = bytes.TrimPrefix(b, []byte("\xef\xbb\xbf"))
-	if bytes.IndexByte(b, 0) >= 0 || !utf8.Valid(b) {
-		return nil, errParse
-	}
-	text := string(b) // one copy; accepted entries are substrings of it
-	lines := strings.Count(text, "\n") + 1
-	d := &setData{}
-	hint := min(lines, limit)
-	switch format {
-	case "domain":
-		d.dom.exact = make(map[string]struct{}, hint)
-		d.dom.suffix = make(map[string]struct{}, hint/4)
-	case "classical":
-		d.dom.exact = map[string]struct{}{}
-		d.dom.suffix = map[string]struct{}{}
-	}
-	bad := 0
-	for len(text) > 0 {
-		var line string
-		if i := strings.IndexByte(text, '\n'); i >= 0 {
-			line, text = text[:i], text[i+1:]
-		} else {
-			line, text = text, ""
-		}
-		line = strings.TrimSpace(line)
-		if line == "" || line[0] == '#' || line[0] == ';' || strings.HasPrefix(line, "//") {
-			continue
-		}
-		var ok, unsupported bool
-		switch format {
-		case "domain":
-			ok, unsupported = d.addDomainLine(line)
-		case "ipcidr":
-			var p netip.Prefix
-			if p, ok = parseCIDR(line, true); ok {
-				d.ip.add(p)
-			}
-		case "classical":
-			ok, unsupported = d.addClassicalLine(line)
-		default:
-			return nil, errParse
-		}
-		switch {
-		case ok:
-			d.entries++
-			if d.entries > limit {
-				return nil, errLimit
-			}
-		case unsupported:
-			d.skipped++
-		default:
-			d.skipped++
-			bad++
-		}
-	}
-	if d.entries == 0 && bad > 0 {
-		return nil, errParse
-	}
-	d.ip.build()
-	d.ipNR.build()
-	return d, nil
-}
-
-func (d *setData) addDomainLine(s string) (ok, unsupported bool) {
-	suffix := false
-	switch {
-	case strings.HasPrefix(s, "+."):
-		suffix, s = true, s[2:]
-	case strings.HasPrefix(s, "."):
-		suffix, s = true, s[1:]
-	case strings.HasPrefix(s, "*"):
-		return false, true // single-level wildcard: not supported
-	}
-	v, ok := normDomain(s)
-	if !ok {
-		return false, false
-	}
-	if suffix {
-		d.dom.suffix[v] = struct{}{}
-	} else {
-		d.dom.exact[v] = struct{}{}
-	}
-	return true, false
-}
-
-func (d *setData) addClassicalLine(line string) (ok, unsupported bool) {
-	typ, rest, found := strings.Cut(line, ",")
-	typ = strings.TrimSpace(typ)
-	if !found || !validType(typ) {
-		return false, false
-	}
-	fields := strings.Split(rest, ",")
-	for i := range fields {
-		fields[i] = strings.TrimSpace(fields[i])
-	}
-	val := fields[0]
-	noResolve := false
-	for _, f := range fields[1:] {
-		if !strings.EqualFold(f, "no-resolve") {
-			return false, true // policy or option we do not understand
-		}
-		noResolve = true
-	}
-	switch strings.ToUpper(typ) {
-	case "DOMAIN":
-		v, ok := normDomain(val)
-		if !ok {
-			return false, false
-		}
-		d.dom.exact[v] = struct{}{}
-	case "DOMAIN-SUFFIX":
-		v, ok := normDomain(strings.TrimPrefix(val, "."))
-		if !ok {
-			return false, false
-		}
-		d.dom.suffix[v] = struct{}{}
-	case "DOMAIN-KEYWORD":
-		v, ok := normKeyword(val)
-		if !ok {
-			return false, false
-		}
-		d.dom.keywords = append(d.dom.keywords, v)
-	case "IP-CIDR", "IP-CIDR6":
-		p, ok := parseCIDR(val, true)
-		if !ok {
-			return false, false
-		}
-		if noResolve {
-			d.ipNR.add(p)
-		} else {
-			d.ip.add(p)
-		}
-	case "GEOIP":
-		v, ok := normGeo(val)
-		if strings.EqualFold(val, "lan") {
-			v, ok = geoPrivate, true
-		}
-		if !ok {
-			return false, false
-		}
-		if noResolve {
-			d.geoNR = append(d.geoNR, v)
-		} else {
-			d.geo = append(d.geo, v)
-		}
-	case "DST-PORT":
-		lo, hi, ok := parsePortRange(val)
-		if !ok {
-			return false, false
-		}
-		d.ports = append(d.ports, portRange{lo, hi})
-	default:
-		return false, true
-	}
-	return true, false
-}
-
-func validType(s string) bool {
-	if s == "" || len(s) > 32 {
-		return false
-	}
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if !(c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-' || c == '_') {
-			return false
-		}
-	}
+	s.v6 = append(s.v6, r6{addr128(lo), addr128(hi)})
 	return true
 }

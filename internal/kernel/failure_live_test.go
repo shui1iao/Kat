@@ -18,8 +18,9 @@ func TestFailureRealDNSRouteDialAndBudget(t *testing.T) {
 		t.Fatal(e)
 	}
 	cfg.Limits.DialTimeout = Duration(50 * time.Millisecond)
+	cfg.Security = &SecurityOptions{AllowLoopback: true} // the closed port is on loopback
 	var b bytes.Buffer
-	s := &Server{cfg: cfg, ctx: context.Background(), dialSlots: make(chan struct{}, 1), failures: &failureLog{write: func(p []byte) error { _, e := b.Write(p); return e }}}
+	s := &Server{cfg: cfg, core: &core{ctx: context.Background(), dialSlots: newSlots(1), failures: &failureLog{write: func(p []byte) error { _, e := b.Write(p); return e }}}}
 	var e error
 	s.dns, e = newInternalDNS(cfg.DNS)
 	if e != nil {
@@ -50,9 +51,9 @@ func TestFailureRealDNSRouteDialAndBudget(t *testing.T) {
 		c.Close()
 		t.Fatal("closed port dialed")
 	}
-	s.dialSlots <- struct{}{}
+	s.dialSlots.try()
 	_, e = s.dial(s.ctx, Address{"127.0.0.1", p})
-	<-s.dialSlots
+	s.dialSlots.release()
 	if e == nil {
 		t.Fatal("budget timeout missing")
 	}

@@ -55,7 +55,7 @@ func testCert(t *testing.T) (*TLSConfig, *x509.CertPool) {
 	}
 	pool := x509.NewCertPool()
 	pool.AppendCertsFromPEM(crt)
-	return &TLSConfig{certPath, keyPath}, pool
+	return &TLSConfig{Cert: certPath, Key: keyPath}, pool
 }
 func startTest(t *testing.T, in Inbound, modify func(*Config)) *Server {
 	t.Helper()
@@ -63,6 +63,8 @@ func startTest(t *testing.T, in Inbound, modify func(*Config)) *Server {
 		in.Listen = "127.0.0.1:0"
 	}
 	c := Config{UDPBindIPv4: "127.0.0.1", UDPBindIPv6: "::1", Inbounds: []Inbound{in}, Limits: Limits{Connections: 32, Handshakes: 16, Dials: 8, UDPAssociations: 8, UDPQueue: 4, UDPTargets: 4, PoolBuffers: 4, HandshakeTimeout: Duration(time.Second), DialTimeout: Duration(time.Second), DrainTimeout: Duration(2 * time.Second), UDPIdle: Duration(time.Second)}}
+	// Existing end-to-end tests use loopback echo targets: allow them explicitly.
+	c.Security = &SecurityOptions{AllowLoopback: true}
 	if modify != nil {
 		modify(&c)
 	}
@@ -500,10 +502,12 @@ func TestSOCKSUDPIsolationAndControl(t *testing.T) {
 	if _, _, e := u2.ReadFromUDP(b); e == nil {
 		t.Fatal("cross-association packet accepted")
 	}
+	// Since 0.7.0 a lone first fragment waits for the rest of its datagram
+	// (socks_frag_test.go); it is discarded when the association ends.
 	socksUDPSend(t, u, relay, target, []byte("fragment"), 1)
 	u.SetReadDeadline(time.Now().Add(60 * time.Millisecond))
 	if _, _, e := u.ReadFromUDP(b); e == nil {
-		t.Fatal("fragment accepted")
+		t.Fatal("incomplete fragment forwarded")
 	}
 	socksUDPSend(t, u, relay, target, []byte("after"), 0)
 	if string(socksUDPRead(t, u)) != "after" {
@@ -518,8 +522,8 @@ func TestSOCKSUDPIsolationAndControl(t *testing.T) {
 	}
 	c2.Close()
 	waitFor(t, func() bool { return s.Stats().UDP == 0 })
-	if s.Stats().Dropped < 2 {
-		t.Fatal("drop not counted")
+	if s.Stats().Dropped < 1 || s.frags.dropped.Load() < 1 || s.frags.used.Load() != 0 {
+		t.Fatal("drop not counted or fragment bytes kept")
 	}
 }
 func TestUDPUnsolicitedSource(t *testing.T) {
@@ -801,7 +805,7 @@ func TestCurlIndependent(t *testing.T) {
 }
 func TestResolveAndDialBudget(t *testing.T) {
 	s := startTest(t, inFor("socks5", nil), func(c *Config) { c.Limits.Dials = 1; c.Limits.DialTimeout = Duration(40 * time.Millisecond) })
-	s.dialSlots <- struct{}{}
+	s.dialSlots.try()
 	ctx := context.Background()
 	if _, e := s.resolve(ctx, Address{"localhost", 53}); e == nil {
 		t.Fatal("DNS quota ignored")
@@ -809,7 +813,7 @@ func TestResolveAndDialBudget(t *testing.T) {
 	if _, e := s.dial(ctx, Address{"127.0.0.1", 9}); e == nil {
 		t.Fatal("dial quota ignored")
 	}
-	<-s.dialSlots
+	s.dialSlots.release()
 	if s.Stats().Dials != 0 {
 		t.Fatal("dial resources leaked")
 	}

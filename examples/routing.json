@@ -1,6 +1,7 @@
 {
   "inbounds": [{"protocol":"socks5", "listen":"127.0.0.1:10820", "users":[{"username":"example-user", "password":"replace-with-your-own-password"}]}],
   "udp_bind_ipv4": "127.0.0.1", "udp_bind_ipv6": "::1",
+  "security":{"allow_loopback": true},
   "outbounds": [
     {"name":"local-ss2022", "type":"shadowsocks", "server":"127.0.0.1", "port":10813, "method":"2022-blake3-aes-128-gcm", "key":"AAECAwQFBgcICQoLDA0ODw=="},
     {"name":"local-ss2017", "type":"shadowsocks", "server":"127.0.0.1", "port":10812, "method":"aes-128-gcm", "password":"replace-with-high-entropy-secret"},

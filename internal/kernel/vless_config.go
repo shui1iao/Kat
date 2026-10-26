@@ -11,6 +11,7 @@ import (
 	VT "github.com/shui1iao/Kat/internal/vtransport"
 	"net/netip"
 	"os"
+	"reflect"
 	"regexp"
 	"strings"
 	"time"
@@ -116,10 +117,24 @@ func (o *RealityOptions) config(l Limits) (VX.RealityConfig, error) {
 	}
 	return VX.RealityConfig{PrivateKey: key, ShortIDs: ids, ServerNames: o.ServerNames, Decoy: decoy, DecoyRoots: roots, MinClientVersion: o.MinClientVersion, MaxClientVersion: o.MaxClientVersion, MaxTimeDiff: o.MaxTimeDiff.value(), MaxSessions: o.MaxSessions}, nil
 }
-func (s *Server) prepareVLESS() error {
+
+// prepareVLESS creates the REALITY servers (with a local decoy preflight).
+// An identical REALITY configuration reuses the previous server.
+func (s *Server) prepareVLESS(prev *Server) error {
 	for i := range s.cfg.Inbounds {
 		in := &s.cfg.Inbounds[i]
 		if in.Reality != nil {
+			if prev != nil {
+				for _, p := range prev.cfg.Inbounds {
+					if p.realityServer != nil && p.Reality != nil && reflect.DeepEqual(*p.Reality, *in.Reality) && prev.cfg.Limits == s.cfg.Limits {
+						in.realityServer = p.realityServer
+						break
+					}
+				}
+				if in.realityServer != nil {
+					continue
+				}
+			}
 			cfg, e := in.Reality.config(s.cfg.Limits)
 			if e != nil {
 				return e

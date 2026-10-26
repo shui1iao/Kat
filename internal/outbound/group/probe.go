@@ -27,6 +27,9 @@ type httpProber struct {
 	target outbound.Addr
 	tls    *tls.Config // nil: standard verification against system roots
 	clk    clock
+	// expected: statuses that count as success (probe.expected_status);
+	// nil = any status below 500.
+	expected func(int) bool
 }
 
 func (p *httpProber) probe(ctx context.Context, m outbound.Outbound) (time.Duration, error) {
@@ -60,7 +63,11 @@ func (p *httpProber) probe(ctx context.Context, m outbound.Outbound) (time.Durat
 	}
 	lat := p.clk.Now().Sub(start)
 	resp.Body.Close()
-	if resp.StatusCode >= 500 {
+	if p.expected != nil {
+		if !p.expected(resp.StatusCode) {
+			return 0, fmt.Errorf("%w %d (not an expected status)", errProbeStatus, resp.StatusCode)
+		}
+	} else if resp.StatusCode >= 500 {
 		return 0, fmt.Errorf("%w %d", errProbeStatus, resp.StatusCode)
 	}
 	return lat, nil

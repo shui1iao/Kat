@@ -92,6 +92,21 @@ func (s EventSink) Emit(event string, fields ...string) {
 	}
 }
 
+type sourceKey struct{}
+
+// WithSource attaches the client source address to ctx (used by groups that
+// balance per source, e.g. load-balance sticky-sessions). Never logged.
+func WithSource(ctx context.Context, ip netip.Addr) context.Context {
+	return context.WithValue(ctx, sourceKey{}, ip)
+}
+
+// SourceFrom returns the client source address attached by WithSource
+// (invalid when none).
+func SourceFrom(ctx context.Context) netip.Addr {
+	ip, _ := ctx.Value(sourceKey{}).(netip.Addr)
+	return ip
+}
+
 // Duration is a JSON string duration ("5s", "10m").
 type Duration time.Duration
 
@@ -159,6 +174,11 @@ type TLSOptions struct {
 	PinSHA256  string   `json:"pin_sha256,omitempty"`
 	Insecure   bool     `json:"insecure,omitempty"`
 	ALPN       []string `json:"alpn,omitempty"`
+	// Fingerprint (0.7.0) makes the ClientHello imitate a browser through
+	// uTLS: chrome, firefox, safari, ios, edge, android, 360, qq, random
+	// (one of chrome/firefox/safari/ios/edge, chosen once per process).
+	// Empty = Go crypto/tls.
+	Fingerprint string `json:"fingerprint,omitempty"`
 }
 
 var errTLSOptions = errors.New("invalid outbound TLS options")

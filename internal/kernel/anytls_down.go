@@ -54,6 +54,10 @@ func returnClearedAnyTLSDown(b []byte) {
 // ss2022Ready is the existing read-only socket readiness predicate (unknown
 // sockets and non-Linux platforms return zero); no SS path or state is changed.
 func (s *Server) copyAnyTLSDown(dst, src, target net.Conn) error {
+	return s.copyAnyTLSDownM(dst, src, target, meter{})
+}
+
+func (s *Server) copyAnyTLSDownM(dst, src, target net.Conn, m meter) error {
 	owner := s.pool.get()
 	defer s.pool.put(owner)
 	small := owner[:min(len(owner), 16377)]
@@ -99,6 +103,9 @@ func (s *Server) copyAnyTLSDown(dst, src, target net.Conn) error {
 			}
 			if nw < 0 || nw > len(buf) || (nw != len(buf) && ew == nil) {
 				ew = io.ErrShortWrite
+			}
+			if nw > 0 && nw <= len(buf) {
+				m.add(nw)
 			}
 			if lease != nil {
 				releaseAnyTLSDown(lease)

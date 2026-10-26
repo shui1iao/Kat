@@ -1,0 +1,56 @@
+{
+  "inbounds": [
+    {
+      "protocol": "vless",
+      "listen": "127.0.0.1:10821",
+      "users": [
+        {
+          "uuid": "4a86ae32-2235-4dc3-b103-42a2d162d73c"
+        }
+      ],
+      "tls": {
+        "cert": "server.crt",
+        "key": "server.key"
+      },
+      "transport": {
+        "type": "xhttp",
+        "path": "/xh/",
+        "host": "localhost",
+        "max_streams": 16,
+        "xhttp": {
+          "mode": "auto",
+          "alpn": [
+            "h2",
+            "http/1.1"
+          ],
+          "max_requests": 16,
+          "max_sessions": 16,
+          "max_unpaired": 8,
+          "max_retired": 128,
+          "max_packet_bytes": 1000000,
+          "max_buffered_packets": 32,
+          "max_buffered_bytes": 2000000,
+          "max_global_buffered_bytes": 16000000,
+          "max_uploads": 10000,
+          "max_upload_bytes": 67108864,
+          "pair_timeout": "10s",
+          "io_timeout": "10s",
+          "retired_ttl": "60s"
+        }
+      }
+    }
+  ],
+  "udp_bind_ipv4": "127.0.0.1",
+  "udp_bind_ipv6": "::1",
+  "limits": {
+    "connections": 32,
+    "logical_streams": 32,
+    "handshakes": 8,
+    "dials": 8,
+    "udp_associations": 8,
+    "udp_queue": 8,
+    "udp_targets": 8,
+    "pool_buffers": 8,
+    "drain_timeout": "5s"
+  }
+}

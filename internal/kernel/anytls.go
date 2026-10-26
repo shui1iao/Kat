@@ -7,6 +7,8 @@ import (
 	A "github.com/shui1iao/Kat/internal/anytls"
 	"io"
 	"net"
+	"reflect"
+	"runtime"
 	"sync/atomic"
 	"time"
 )
@@ -67,9 +69,24 @@ func (o *AnyTLSOptions) normalize(connections int) error {
 	}
 	return nil
 }
-func (s *Server) prepareAnyTLS() error {
+
+// prepareAnyTLS creates the AnyTLS codecs; a previous codec with an
+// identical configuration is reused (budgets continue across a reload).
+func (s *Server) prepareAnyTLS(prev *Server) error {
 	codecs := map[[32]byte]*A.Server{}
 	options := map[[32]byte]AnyTLSOptions{}
+	type anyPrev struct {
+		conf  A.Config
+		codec *A.Server
+	}
+	var prevs []anyPrev
+	if prev != nil {
+		for _, in := range prev.cfg.Inbounds {
+			if in.anytlsServer != nil {
+				prevs = append(prevs, anyPrev{in.anytlsConf, in.anytlsServer})
+			}
+		}
+	}
 	for i := range s.cfg.Inbounds {
 		in := &s.cfg.Inbounds[i]
 		if in.AnyTLS == nil {
@@ -81,16 +98,26 @@ func (s *Server) prepareAnyTLS() error {
 			return errors.New("same AnyTLS identity must share budgets")
 		}
 		codec := codecs[id]
+		conf := A.Config{Password: o.Password, MaxSessions: o.MaxSessions, MaxTotalStreams: o.MaxStreams, MaxStreams: o.SessionStreams, StreamInboundBytes: o.StreamBytes, StreamOutboundBytes: o.StreamBytes, SessionInboundBytes: o.SessionBytes, SessionOutboundBytes: o.SessionBytes, HandshakeTimeout: s.cfg.Limits.HandshakeTimeout.value(), TargetTimeout: s.cfg.Limits.HandshakeTimeout.value(), SlowConsumerTimeout: o.SlowTimeout.value(), WriteTimeout: o.SlowTimeout.value()}
+		if codec == nil {
+			for _, p := range prevs {
+				if reflect.DeepEqual(p.conf, conf) {
+					codec = p.codec
+					break
+				}
+			}
+		}
 		if codec == nil {
 			var e error
-			codec, e = A.NewServer(A.Config{Password: o.Password, MaxSessions: o.MaxSessions, MaxTotalStreams: o.MaxStreams, MaxStreams: o.SessionStreams, StreamInboundBytes: o.StreamBytes, StreamOutboundBytes: o.StreamBytes, SessionInboundBytes: o.SessionBytes, SessionOutboundBytes: o.SessionBytes, HandshakeTimeout: s.cfg.Limits.HandshakeTimeout.value(), TargetTimeout: s.cfg.Limits.HandshakeTimeout.value(), SlowConsumerTimeout: o.SlowTimeout.value(), WriteTimeout: o.SlowTimeout.value()})
+			codec, e = A.NewServer(conf)
 			if e != nil {
 				return errors.New("invalid AnyTLS server config")
 			}
-			codecs[id] = codec
-			options[id] = *o
 		}
+		codecs[id] = codec
+		options[id] = *o
 		in.anytlsServer = codec
+		in.anytlsConf = conf
 	}
 	return nil
 }
@@ -110,15 +137,30 @@ func (c *anyStream) SetWriteDeadline(t time.Time) error { return c.st.SetWriteDe
 
 // FIN is whole-stream close. Do not offer a fabricated half-close capability.
 func (s *Server) serveAnyTLS(parent context.Context, c net.Conn, in Inbound) {
+	acc := s
 	e := in.anytlsServer.Serve(parent, c, func(ctx context.Context, st *A.Stream, r A.Request) {
-		if !acquire(s.logicalSlots) {
+		// Each stream is a new proxied connection: it is routed by the current
+		// configuration even when its session was accepted by an older one.
+		// The current generation cannot be released while it is current, so
+		// the loop ends as soon as a reload in progress has been installed.
+		s := acc.current()
+		for s.core != nil && !s.tryRef() {
+			runtime.Gosched()
+			s = acc.current()
+		}
+		if s != acc {
+			ctx = acc.withInboundStat(ctx)
+			ctx = s.currentInboundMeta(ctx, acc)
+		}
+		defer s.unref()
+		if !s.logicalSlots.try() {
 			s.failure(failAnyBudget, in.Protocol, in.logIndex)
 			s.counters.Rejected.Add(1)
 			st.Close()
 			return
 		}
 		s.logical.Add(1)
-		defer func() { <-s.logicalSlots; s.logical.Add(-1); st.Close() }()
+		defer func() { s.logicalSlots.release(); s.logical.Add(-1); st.Close() }()
 		if ctx.Err() != nil {
 			return
 		}
@@ -143,15 +185,26 @@ func (s *Server) serveAnyTLS(parent context.Context, c net.Conn, in Inbound) {
 			}
 			return
 		}
-		out, e := s.dial(ctx, Address{r.Target.Host, r.Target.Port})
+		target := Address{r.Target.Host, r.Target.Port}
+		sctx, sstream, first, _, _ := s.sniffTCP(ctx, stream, target, nil)
+		f, fctx := s.newFlow(sctx, "tcp", target)
+		out, e := s.dial(fctx, target)
 		if e != nil {
+			f.end(dialResult(e))
 			return
 		}
+		defer f.end("ok")
 		defer out.Close()
-		s.relayAnyTLS(ctx, stream, out)
+		if forwardSniffed(fctx, out, first) != nil {
+			return
+		}
+		s.relayAnyTLS(fctx, sstream, out)
 	})
 	if k, ok := anyTLSFailure(e); ok {
 		s.failure(k, in.Protocol, in.logIndex)
+	}
+	if errors.Is(e, A.ErrAuthentication) {
+		s.authFailed(c.RemoteAddr(), &in)
 	}
 }
 
@@ -163,8 +216,9 @@ func (s *Server) relayAnyTLS(ctx context.Context, stream, out net.Conn) {
 	done := make(chan error, 2)
 	a := &activityStream{stream, &last}
 	b := &activityStream{out, &last}
-	go func() { done <- s.copyAnyTLSDown(a, b, out) }()
-	go func() { done <- s.copyAnyTLSUp(b, a) }()
+	mUp, mDown := meters(ctx)
+	go func() { done <- s.copyAnyTLSDownM(a, b, out, mDown) }()
+	go func() { done <- s.copyAnyTLSUpM(b, a, mUp) }()
 	idle := s.cfg.Limits.TCPIdle.value()
 	if idle == 0 {
 		idle = 5 * time.Minute

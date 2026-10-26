@@ -37,12 +37,7 @@ IP-CIDR6,2001:db8:abcd::/48
 IP-CIDR,198.51.100.0/24
 GEOIP,CN
 DST-PORT,6881-6889
-PROCESS-NAME,foo.exe
-USER-AGENT,Foo*
-URL-REGEX,^http://x
-IP-ASN,13335,no-resolve
 AND,((DOMAIN,a.example),(DST-PORT,443))
-DOMAIN-SUFFIX,policy.example,DIRECT
 IP-CIDR,300.0.0.0/8
 garbage line
  domain-suffix , lower.example
@@ -53,11 +48,12 @@ func TestParseDomainSet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d.entries != 5 || d.skipped != 3 {
+	if d.entries != 6 || d.skipped != 2 {
 		t.Fatalf("entries=%d skipped=%d", d.entries, d.skipped)
 	}
-	yes := []string{"apple.com", "www.apple.com", "google.com", "a.b.google.com", "exact.example", "upper.example.org", "crlf.example"}
-	no := []string{"notapple.com", "com", "sub.exact.example", "x.wild.example", "example.org", "bad..domain", ""}
+	// 0.7.0: "*.x" is mihomo's one-label wildcard (0.6 skipped it).
+	yes := []string{"apple.com", "www.apple.com", "google.com", "a.b.google.com", "exact.example", "upper.example.org", "crlf.example", "x.wild.example"}
+	no := []string{"notapple.com", "com", "sub.exact.example", "wild.example", "a.x.wild.example", "example.org", "bad..domain", ""}
 	for _, h := range yes {
 		if !d.dom.match(h) {
 			t.Fatal("should match", h)
@@ -98,8 +94,16 @@ func TestParseClassicalSet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d.entries != 9 || d.skipped != 8 {
+	if d.entries != 10 || d.skipped != 2 {
 		t.Fatalf("entries=%d skipped=%d", d.entries, d.skipped)
+	}
+	// Unsupported rule types and options refuse the whole set (0.6 skipped them).
+	for _, l := range []string{"PROCESS-NAME,foo.exe", "USER-AGENT,Foo*", "URL-REGEX,^http://x", "IP-ASN,13335,no-resolve", "DOMAIN-SUFFIX,policy.example,DIRECT", "SUB-RULE,(NETWORK,tcp),sub", "RULE-SET,x", "MATCH", "AND,((DOMAIN,a),(PROCESS-NAME,b))"} {
+		_, err := parseRuleSet("classical", []byte("DOMAIN,ok.example\n"+l+"\n"), maxSetEntries)
+		var u *unsupportedError
+		if !errors.As(err, &u) || !strings.Contains(err.Error(), "line 2") {
+			t.Fatal(l, err)
+		}
 	}
 	for _, h := range []string{"exact.example", "suffix.example", "a.suffix.example", "my-tracker.test", "lower.example"} {
 		if !d.dom.match(h) {
@@ -143,10 +147,9 @@ func TestParseFailures(t *testing.T) {
 	if d, err := parseRuleSet("domain", []byte("a.x\nb.x\nc.x\nd.x\n"), 4); err != nil || d.entries != 4 {
 		t.Fatal("at limit", err)
 	}
-	// Only unsupported (not malformed) lines: loads as an empty set.
-	d, err := parseRuleSet("classical", []byte("PROCESS-NAME,a\nUSER-AGENT,b\n"), maxSetEntries)
-	if err != nil || d.entries != 0 || d.skipped != 2 {
-		t.Fatal("unsupported-only", d, err)
+	// Unsupported lines are an error, not an empty set.
+	if _, err := parseRuleSet("classical", []byte("PROCESS-NAME,a\nUSER-AGENT,b\n"), maxSetEntries); dataClass(err) != classUnsup {
+		t.Fatal("unsupported-only", err)
 	}
 }
 
@@ -172,8 +175,8 @@ func TestRuleSetEngineEventsAndLimits(t *testing.T) {
 		},
 	}
 	e := mustEngine(t, o, ev)
-	if ev.count("rule_set_loaded", "name", "c", "entries", "9", "skipped", "8") != 1 ||
-		ev.count("rule_set_loaded", "name", "d", "entries", "5", "skipped", "3") != 1 ||
+	if ev.count("rule_set_loaded", "name", "c", "entries", "10", "skipped", "2") != 1 ||
+		ev.count("rule_set_loaded", "name", "d", "entries", "6", "skipped", "2") != 1 ||
 		ev.count("rule_set_loaded", "name", "i", "entries", "5", "skipped", "2") != 1 ||
 		ev.count("rule_set_update_failed", "name", "bad", "class", "parse") != 1 ||
 		ev.count("rule_set_update_failed", "name", "gone", "class", "missing") != 1 ||

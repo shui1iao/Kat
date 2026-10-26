@@ -23,6 +23,7 @@ func startKernel(t *testing.T, listen, certFile, keyFile, password string) (*ker
 		TLS:    &kernel.TLSConfig{Cert: certFile, Key: keyFile},
 		AnyTLS: &kernel.AnyTLSOptions{Password: password},
 	}}}
+	cfg.Security = &kernel.SecurityOptions{AllowLoopback: true}
 	s, e := kernel.Start(cfg)
 	if e != nil {
 		t.Fatal(e)

@@ -58,6 +58,7 @@ type autoGroup struct {
 	paused    bool        // smart: periodic probing paused for inactivity
 	tickStop  func() bool // smart: pending periodic tick
 	sites     *siteCache  // smart
+	lb        *lbState    // load-balance
 	wg        sync.WaitGroup
 	roundsRun atomic.Int64 // completed probe rounds (tests)
 }
@@ -70,6 +71,9 @@ func newAutoGroup(c config, ms []outbound.Outbound, events outbound.EventSink, h
 	g.curSince = g.clk.Now()
 	if c.kind == TypeSmart {
 		g.sites = newSiteCache(smartSiteCap)
+	}
+	if c.kind == TypeLoadBalance {
+		g.lb = newLBState()
 	}
 	return g
 }
@@ -126,7 +130,11 @@ func (g *autoGroup) Start(ctx context.Context) {
 	g.started = true
 	g.ctx, g.cancel = context.WithCancel(ctx)
 	g.stopCtx = context.AfterFunc(g.ctx, g.stopTimers)
-	if g.cfg.kind == TypeSmart {
+	switch {
+	case g.cfg.kind == TypeSmart && g.cfg.lazy:
+		// lazy smart: nothing until the first use resumes probing.
+		g.paused = true
+	case g.cfg.kind == TypeSmart, !g.cfg.lazy:
 		now := g.clk.Now()
 		g.lastUse = now
 		g.triggerRoundLocked()
@@ -199,6 +207,12 @@ func (g *autoGroup) tick() {
 	if !g.activeLocked() {
 		return
 	}
+	if g.cfg.kind != TypeSmart {
+		// lazy: false (url-test, fallback, load-balance): probe every interval.
+		g.triggerRoundLocked()
+		g.scheduleTickLocked()
+		return
+	}
 	if g.clk.Now().Sub(g.lastUse) >= smartIdleFactor*g.cfg.interval {
 		g.paused = true
 		return
@@ -211,7 +225,7 @@ func (g *autoGroup) tick() {
 func (g *autoGroup) useLocked(now time.Time) {
 	g.lastUse = now
 	switch g.cfg.kind {
-	case TypeURLTest, TypeFallback:
+	case TypeURLTest, TypeFallback, TypeLoadBalance:
 		if !g.hasRound || now.Sub(g.lastRound) >= g.cfg.interval {
 			g.triggerRoundLocked()
 		}
@@ -260,7 +274,7 @@ func (g *autoGroup) runRound(ctx context.Context) {
 				s.probeLat = r.lat
 			}
 			switch g.cfg.kind {
-			case TypeFallback:
+			case TypeFallback, TypeLoadBalance:
 				if r.err == nil {
 					s.consec = 0 // a successful probe brings the member back
 				}
@@ -313,7 +327,7 @@ func (g *autoGroup) urlTestReevalLocked(now time.Time) {
 
 func (g *autoGroup) fallbackUpLocked(i int) bool {
 	s := g.st[i]
-	return (!s.probed || s.probeOK) && s.consec < fallbackFailLimit
+	return (!s.probed || s.probeOK) && s.consec < g.cfg.maxFailed
 }
 
 // fallback: first member (in order) whose last probe succeeded (or that was
@@ -382,6 +396,9 @@ func (g *autoGroup) candidatesLocked(host string, udp bool, now time.Time) []int
 // maxAttempts members in total, within ctx. Failures after the connection is
 // returned are reported to the caller and never retried.
 func (g *autoGroup) DialTCP(ctx context.Context, dst outbound.Addr) (net.Conn, error) {
+	if g.cfg.kind == TypeLoadBalance {
+		return g.lbDialTCP(ctx, dst)
+	}
 	g.mu.Lock()
 	now := g.clk.Now()
 	g.useLocked(now)
@@ -414,6 +431,9 @@ func (g *autoGroup) DialTCP(ctx context.Context, dst outbound.Addr) (net.Conn, e
 // ListenPacket picks among UDP-capable members only. The returned session
 // stays on that member for its whole life.
 func (g *autoGroup) ListenPacket(ctx context.Context) (outbound.PacketConn, error) {
+	if g.cfg.kind == TypeLoadBalance {
+		return g.lbListenPacket(ctx)
+	}
 	g.mu.Lock()
 	now := g.clk.Now()
 	g.useLocked(now)
@@ -481,13 +501,20 @@ func (g *autoGroup) realFailure(i int, host string, refused bool) {
 			}
 		}
 		s.failTimes = append(kept, now)
-		if len(s.failTimes) >= urlTestFailCount || refused {
+		if len(s.failTimes) >= g.cfg.maxFailed || refused {
 			s.failTimes = nil
 			g.triggerRoundLocked()
 		}
 	case TypeFallback:
 		s.consec++
 		g.reevaluateLocked(now)
+	case TypeLoadBalance:
+		s.consec++
+		if s.consec == g.cfg.maxFailed {
+			// The member is now skipped; re-test at once so that it can
+			// come back as soon as it answers probes again.
+			g.triggerRoundLocked()
+		}
 	case TypeSmart:
 		g.smartFailLocked(i, now)
 		if host != "" {
@@ -508,6 +535,9 @@ func (g *autoGroup) realSuccess(i int, host string, ttfb time.Duration, hasTTFB 
 	case TypeFallback:
 		g.st[i].consec = 0
 		g.reevaluateLocked(now)
+	case TypeLoadBalance:
+		g.st[i].consec = 0
+		g.st[i].probeOK = true
 	case TypeSmart:
 		g.smartSuccessLocked(i, ttfb, hasTTFB, now)
 		if host != "" {

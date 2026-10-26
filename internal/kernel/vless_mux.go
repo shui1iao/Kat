@@ -62,15 +62,17 @@ func (s *Server) serveMux(parent context.Context, c net.Conn, uuid [16]byte) err
 			n = nil
 		}
 		if n == nil {
-			if !acquire(s.udpSlots) {
+			if !s.udpSlots.try() {
 				s.counters.Dropped.Add(1)
 				continue
 			}
-			child, stop := context.WithCancel(ctx)
-			a := &udpAssociation{server: s, ctx: child, cancel: stop, queue: make(chan packet, s.cfg.Limits.UDPQueue), allowed: map[netip.AddrPort]time.Time{}, source: sourceOf(parent)}
+			f, fctx := s.newFlow(ctx, "udp", Address{})
+			child, stop := context.WithCancel(fctx)
+			a := &udpAssociation{server: s, ctx: child, cancel: stop, queue: make(chan packet, s.cfg.Limits.UDPQueue), allowed: map[netip.AddrPort]time.Time{}, source: sourceOf(parent), flow: f}
 			if e = a.openOutbound(); e != nil {
 				stop()
-				<-s.udpSlots
+				f.end("udp_socket_failed")
+				s.udpSlots.release()
 				return e
 			}
 			n = &muxAssociation{a: a, last: d}
@@ -93,7 +95,11 @@ func (s *Server) serveMux(parent context.Context, c net.Conn, uuid [16]byte) err
 			}
 			workers.Add(1)
 			s.counters.UDP.Add(1)
-			go func() { defer workers.Done(); defer func() { s.counters.UDP.Add(-1); <-s.udpSlots }(); s.runMuxUDP(a) }()
+			go func() {
+				defer workers.Done()
+				defer func() { s.counters.UDP.Add(-1); s.udpSlots.release(); a.flow.end("ok") }()
+				s.runMuxUDP(a)
+			}()
 		}
 		n.mu.Lock()
 		n.last = d

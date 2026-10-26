@@ -596,6 +596,17 @@ func (w *e2eWorld) sbAnyTLS(name string) *e2eProc {
 // katProc runs the Kat binary under test with cfg (the "listen" of the first
 // inbound decides the readiness port).
 func (w *e2eWorld) katProc(name string, cfg map[string]any) *e2eProc {
+	// Loopback targets are used throughout; the management socket and the
+	// statistics file are not needed and must not land in system paths.
+	if _, ok := cfg["security"]; !ok {
+		cfg["security"] = map[string]any{"allow_loopback": true}
+	}
+	if _, ok := cfg["api"]; !ok {
+		cfg["api"] = map[string]any{"enabled": false}
+	}
+	if _, ok := cfg["stats"]; !ok {
+		cfg["stats"] = map[string]any{"persist": false}
+	}
 	ins := cfg["inbounds"].([]any)
 	_, p, _ := net.SplitHostPort(ins[0].(map[string]any)["listen"].(string))
 	port, _ := strconv.Atoi(p)

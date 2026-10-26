@@ -1,93 +1,78 @@
-# Kat 0.6.3：AnyTLS max_sessions 默认跟随 connections
+# Kat 0.7.0：热重载、自动证书、规则嗅探与动态策略组
 
-本版本提供中文源码说明，以及 Linux amd64 静态二进制、SHA-256 校验文件和第三方许可附件。相对 0.6.2 只改一处默认值：AnyTLS 入站身份的 `max_sessions` 在省略或填 0 时，不再固定为 512，而是跟随全局 `limits.connections`。显式填写的值、各项取值范围和其他功能都与 0.6.2 相同。
+这是整批 0.7 功能的首个公开版本，接续 v0.6.3。开发阶段的编号不代表已公开的多个版本。本次只发布 GitHub 源码、标签与 Linux amd64 附件，不自动更新已运行的服务。
 
-## 变更
+## 主要变化
 
-### AnyTLS `max_sessions` 默认值跟随 `connections`
+### 日志、统计与本机管理
 
-- 省略（或填 0）时，`max_sessions` 等于 `limits.connections`。`connections` 也省略时为 4096，所以默认就是 4096（0.6.2 为 512）；把 `connections` 调小，未填写的 `max_sessions` 会一起变小。
-- 显式填写的 `max_sessions` 行为不变：取值 1–65536，越界照旧被 `kat check` 拒绝，错误信息不变。
-- 同一密码出现在多个入口时仍共享一个身份，冲突检查仍按生效值比较。`logical_streams` 的自动取值仍是 `max(8192, 各不同密码身份 max_streams 之和)`，与 `max_sessions` 无关。`kat check` 与 `kat run` 得到相同的值。
-- 其他 AnyTLS 默认值（`max_streams` 4096、`session_streams` 64、`stream_bytes`、`session_bytes`、`slow_timeout` 60s）和全局 `limits` 默认值都没有改。
+- 可选分级 text/JSON 日志、文件轮转与访问日志；不配置日志时仍是 stderr、text、info。访问日志默认关闭，开启后记录完整目标和截断来源（IPv4 /24、IPv6 /48）；连接明细同样默认关闭。安全查询命令可显示完整来源，诊断来源事件仅显示截断前缀。请按需启用并管理权限与保存时间，勿把所有日志都视为无敏感信息。
+- 有效载荷字节统计、全局/入站/出站/组/规则计数、速率、累计值持久化、连接明细与关闭操作。计量不包含协议/TLS/TCP/IP 封装，不等同网卡或服务商计费。
+- 本机管理 API 与 `kat stats/conns/log/reload/select/bans`。默认 Unix socket 使用本用户权限；可选 TCP 只允许回环并必须配置密钥，不是公网 API，也不兼容 Clash API。
 
-### 其他
+### 全配置热重载与持久选择
 
-- 版本输出 `kat 0.6.3`。README 的“AnyTLS 身份额度”表和内存说明相应更新。
+- SIGHUP 或 `kat reload` 重读启动配置；核心转发配置准备成功后切换，新连接用新配置，已建 TCP/UDP 流保留旧代直至结束。同地址监听复用，准备失败保持原配置。
+- 入站增删改、出站、策略组、规则/数据、DNS、额度、日志、安全等均接入；统计按名称延续，不因重载清零。
+- `kat select` 切换只影响新连接，选择可持久化，成员消失或配置默认值改变时回配置。不是监视整份配置文件自动重载。
 
-## 为什么
+### TLS 与自动证书
 
-- 用 mihomo v1.19.33 作客户端测试发现：mihomo 把每条 UDP 流放进一个独占的 AnyTLS 会话，并在最后一个包之后再保留 60 秒（mihomo 内部写死，不可配置）。所以 mihomo 系客户端占用的会话数约等于“并发 TCP 连接数 + 最近 60 秒内活跃的 UDP 流数”。几位用户共用同一个密码时，很容易超过 512，表现为日志 `session_or_stream_budget`。
-- 本机回环实测（Kat 配置不写任何额度，mihomo 每轮 320 条 TCP 下载加 100 个 UDP，连续 3 轮）：0.6.2 在第 3 轮出现 131 次 `session_or_stream_budget` 拒绝，47 条 TCP、59 个 UDP 失败；0.6.3 两次重复都是 0 次拒绝，Kat 侧会话峰值约 620。
-- 每个 AnyTLS 会话本来就占一个物理连接，受 `connections` 限制。让 `max_sessions` 默认跟随 `connections`，单一密码就能用到全局连接额度，用户只需要调 `connections` 一个值。
+- Trojan/AnyTLS 入站：外部证书文件跟随、reload 换证、SNI 多证书与客户端算法选择、ALPN、TLS 1.2/1.3 版本范围、TLS 1.2 安全套件。无效新证书保留旧证书，换证不切断已有流。
+- ACME 四种使用方式：Cloudflare DNS-01、HTTP-01 独立监听、HTTP-01 webroot、TLS-ALPN-01；持久保存账户/证书，自动续期和失败退避。仅显式配置时启用；默认 CA 为 Let's Encrypt 正式环境，试用应显式指定 staging。公网挑战可达性与 DNS Token 权限需由部署者准备。
+- Trojan/AnyTLS 出站可用 uTLS 客户端指纹；默认仍用标准 TLS，CA/证书 pin 校验方式不变。
+- 入站与内置 direct 出站可选 TFO，**默认关闭，不改系统 sysctl**，依赖 Linux/内核及对应系统位支持。详见 [TLS/ACME/TFO 文档](docs/tls-acme-tfo.md)。
 
-## 兼容性
+### 来源安全与 SOCKS5
 
-- **显式填写的 `max_sessions` 不变**：取值、校验、错误信息和运行时效果都与 0.6.2 相同。
-- **未填写时会话上限变大，升级后行为可能不同**：0.6.2 下因会话数达到 512 被拒绝的连接，现在会被接受，内存占用可能相应升高（见下文“内存”）。如果显式填写了小于 512 的 `connections` 而没有填 `max_sessions`，默认值会变小到 `connections`，但会话本来就受 `connections` 限制，实际可用的会话数不会减少。
-- **同一密码多个入口、一个填写一个不填写**：冲突仍按生效值判断。0.6.2 下“一个入口省略、另一个入口写 `max_sessions: 512`”能通过（都是 512），0.6.3 下省略的那个变为 `connections`，两者不一致，`kat check` 会拒绝（`same AnyTLS identity has conflicting limits`）。升级前请让同一密码的各入口写相同的值，或都不写。
-- **一个身份可以用满全部连接**：0.6.2 下每个密码最多 512 个会话，对多个密码之间有一定隔离；0.6.3 默认每个密码都能用到 `connections`。需要在多个密码之间分配额度时，请为各身份显式填写 `max_sessions`。
-- 只用 0.6.3 默认值的配置可以退回 0.6.2 运行（会话上限回到 512）；上一条所说的“一个入口省略、另一个入口显式写成 `connections` 的值”这种配置，退回 0.6.2 时会被拒绝。
-- AnyTLS 出站、其他入站协议、出站、链式代理、策略组、规则分流与 0.6.2 相同。
+- 可选认证失败临时封禁、每 IP TCP 并发上限、每入站来源黑白名单；封禁与并发限制默认关闭，IPv6 按 /64 记账；UDP 认证失败不计猜密，防止伪造来源误封。封禁跨重载保留，关闭即清空、重启清空。
+- Trojan TLS 握手后支持可选 TCP fallback，不是完整反探测系统。**即使未配置 fallback，首个非法 Trojan 字节会立即失败，不再等满 56 字节**，可能改变探测时序。
+- SOCKS5 BIND 默认关闭；启用后只按请求目标 IP 匹配对端，不用 DST.PORT 筛选；直连转发，不经过路由规则。
+- SOCKS5 UDP 分片有界重组默认开启，默认每关联最多 65535 字节、全局 4 MiB、5 秒超时。**允许乱序，不采用 RFC 1928 较小 FRAG 重置队列要求**；回包不分片，不宣称严格 RFC 全兼容。BIND/分片专项使用独立协议客户端，不冒称主流客户端扩展覆盖。
 
-## 内存
+### 规则、数据格式与嗅探
 
-- 正常使用时内存占用不大：在本机回环上用 sing-box 1.14.3 或 mihomo v1.19.33 作客户端、几百个并发流测试（Kat 配置不写任何额度），进程 RSS 峰值约 38–103 MiB；其中 mihomo AnyTLS 三轮背靠背、会话峰值约 620 时为 78–82 MiB。数量超过额度时直接拒绝，内存不随请求数增长。
-- AnyTLS 会话缓冲的上界公式不变：`min(max_sessions × 2 × session_bytes, max_streams × 2 × stream_bytes)`，入、出方向分别计费。默认 `max_sessions` 变为 4096 后，前一项是 8 GiB，后一项（`max_streams` 4096 × 2 × 128 KiB）是 1 GiB，所以单身份仍约 **1 GiB**，由 `max_streams` 决定。
-- 会话数上限变大后，每个会话还有不计入上式的固定开销：已关闭流的记录（每会话最多 1024 个流 ID，实测约 25 KiB）和少量控制帧队列。4096 个会话合计最多约 0.1 GiB（0.6.2 的 512 个会话约 12 MiB）。连接复制缓冲、TLS 记录缓冲、goroutine 栈原本就按 `connections` 4096 估算，不变。
-- 因此持有凭据的使用者刻意占满所有缓冲时，单个 AnyTLS 身份的理论上界约 **2.9 GiB**（0.6.2 估算约 2.8 GiB）：AnyTLS 会话缓冲约 1 GiB，UDP 关联队列 `udp_associations × udp_queue_bytes` 约 1 GiB，其余是连接复制缓冲、TLS 记录缓冲、UDP 读缓冲、goroutine 栈和上述每会话开销；每多一个使用默认额度的 AnyTLS 身份再增加约 1 GiB。
-- **内存较小的机器（例如 2 GB）或需要隔离不可信用户时，请在配置中显式填写更小的值。** 例如 `limits.udp_associations: 256`，以及 AnyTLS 的 `max_sessions: 128`、`max_streams: 1024`，可把上面两项最大的缓冲各降到约 256 MiB；也可以减小 `connections`（未填写的 `max_sessions` 随之变小）、`session_bytes`、`stream_bytes`，或把 `slow_timeout` 写回 `10s`。本版本没有为小内存机器另设默认值。
+- 增加域名正则/通配符、IP 后缀/ASN、来源地理/ASN/端口、入站名字/类型/端口、协议和嵌套 AND/OR/NOT；端口支持范围与列表。
+- GeoSite 与 ASN 数据按用户配置加载/更新；支持文本、Clash YAML、mihomo MRS、sing-box SRS/JSON、Surge RULE-SET/DOMAIN-SET 的受支持子集。未知类型/字段明确拒绝，保留旧数据，不静默兼容不支持的规则。
+- 入站可选 TLS SNI、HTTP Host、QUIC Initial SNI 嗅探，**默认关闭**；默认只用于匹配，不覆盖实际目标。开启目标覆盖时重新解析且仍受安全限制。只读首包，超时/端口边界见 README。
+- 不分发 GeoIP/GeoSite/ASN 数据，部署者需自行准备并遵守数据许可。
 
-## 已知限制
+### 策略组与 provider
 
-- 默认值面向几位用户的日常使用，不防持有凭据的恶意用户；理论内存上界见上文。默认情况下一个密码可以占满全部 `connections`，多个密码之间不再有默认的会话隔离。
-- mihomo 的 UDP 流会占住会话 60 秒，这是客户端行为，Kat 无法提前回收；大量短 UDP 流仍可能在 `connections` 用满时被拒绝。
-- 0.6.2 的已知限制全部沿用：
-  - 随机证书模式（AnyTLS 入站省略 `tls`）下客户端必须跳过校验，无法校验服务端身份，也无法固定指纹；证书每次重启都会变，只存在于内存中，不能导出，不能指定名称或有效期。
-  - 未支持：VLESS、Snell、HTTP 等其他出站协议；SS2022 EIH/多用户出站；uTLS 指纹；load-balance、条件组和订阅组；运行中切换 select 的控制接口；AND/OR/NOT 逻辑规则、GeoSite、ASN、进程/UA/URL 规则；mrs/srs/YAML 规则集；mihomo YAML 配置兼容。
-  - 组不重放已发出的数据。Shadowsocks/Trojan 的凭据错误要到首次读写才暴露，经过该成员的第一条连接会失败，之后组才会降级它。
-  - url-test 无法区分 Shadowsocks/Trojan 凭据错误与目标网站出错，只能按“60 秒内 3 次真实失败”触发重测；只有代理服务器直接拒绝连接时才立即重测。
-  - 策略组的测速与评分状态只保存在内存中，重启后重新测速。
-  - 入站方面沿用 0.5.20 的边界：SS2022 不支持 EIH/iPSK 链，初始盐与固定头不保证任意 TCP 首段分片可接受；AnyTLS UDP 使用 UoT v2，不是原生 UDP；Trojan 不含完整 fallback/反探测行为；同身份多监听入口迁移后可能短暂从旧入口回包。
-  - VLESS / Snell 入站仍为实验实现且工作暂停，不作为正式支持承诺。
-  - 示例是回环测试配置，公开占位密码/密钥不可部署；TLS 示例需要自行准备证书和私钥。
+- `load-balance` 支持 round-robin、consistent-hashing、sticky-sessions；`relay` 提供有序独立克隆链（最多四跳）。健康检查、lazy、失败阈值、预期状态码与动态成员过滤可配置。
+- HTTP/file provider 解析 Clash 节点、URI/base64 列表、sing-box 出站；仅支持既有 SS/Trojan/AnyTLS/SOCKS5 节点，不是整份客户端配置兼容。缓存与失败保旧、节点改名/跳过报告、动态配置代重建、现有流保留和 select 状态均接入。
+- provider 的客户端指纹映射到 Trojan/AnyTLS uTLS，证书 fingerprint 仍是证书 pin，两者不互相覆盖。订阅 URL、请求头和节点凭据不写入报告；不支持的插件、传输、多路复用等字段有明确边界。
 
-## 验证范围与未验证范围
+## 默认值、升级与兼容性
 
-已做：重新运行了全部普通测试、全部包的竞态检测（`-race`）、`go vet`、`GOOS=windows` 交叉编译，以及真实进程端到端测试（出站、链式代理、四种策略组、规则分流、随机证书模式，以 sing-box 1.14.3 和 Kat 自身作为本机上游服务端）。新增单元测试覆盖：省略或填 0 的 `max_sessions` 等于 `connections`（`connections` 省略时 4096，写 1000 时 1000）；显式值保持原值、越界照旧拒绝；同一密码多个入口共享身份与冲突判断；`kat check` 与 `kat run` 结果一致，以及重新校验时跟随变化后的 `connections`。新测试放到 0.6.2 源码上会失败（显式值相关的测试照常通过）。
+- **客户端代理流量默认禁止直连回环、未指定地址及其映射形式**，包括管理回环接口。确需本机目标可显式 `security.allow_loopback: true`，但会扩大可访问面；管理 TCP 密钥仍必需。私网默认允许，`block_private` 默认 false。内核自身 DNS/探测/订阅及连接上游代理不受客户端目标限制。
+- **SIGHUP 从 0.6.x 的默认退出改为 reload。** 依赖 SIGHUP 重启的脚本应改用 SIGTERM 或显式 restart；SIGINT/SIGTERM 仍按 drain_timeout 正常退出。
+- 资源额度和 AnyTLS `max_sessions` 跟随 `limits.connections` 的默认值保持 v0.6.3；额度不是全进程内存硬上限。旧配置通常可用，但默认回环限制可能有意阻止以前能访问的目标，升级前先 `kat check`。
+- 新增状态目录、统计与管理 socket 默认路径可能需要服务沙箱授予写权限。示例均为回环测试配置，公开密码/密钥不可用于真实服务。
+- 不新增多用户、mTLS、ECH 或 Kat-Manager 功能适配；附件名称、校验文件与版本命令沿用既有下载校验格式，不代表所有管理功能已有适配。
 
-第三方客户端测试只在本机回环上进行，Kat 配置不写任何额度：
+## 保留的已知限制
 
-| 客户端 | 协议与负载 | 0.6.3 拒绝数 | Kat RSS 峰值 | Kat 侧会话/连接峰值 |
-| --- | --- | --- | --- | --- |
-| mihomo v1.19.33 | AnyTLS，320 TCP + 100 UDP，连续 3 轮（两次） | 0、0 | 81.4、77.5 MiB | 619、620 |
-| mihomo v1.19.33 | 同上，0.6.2 对照 | 131（`session_or_stream_budget`） | 78.2 MiB | 527（会话数卡在 512，多出的 TLS 连接被拒） |
-| mihomo v1.19.33 | Shadowsocks 2022，320 TCP + 100 UDP，3 轮 | 0 | 102.7 MiB | 320 |
-| mihomo v1.19.33 | Trojan，150 TCP + 50 UDP，3 轮 | 0 | 48.6 MiB | 294 |
-| sing-box 1.14.3 | AnyTLS，320 TCP + 100 UDP，3 轮 | 0 | 63.3 MiB | 451 |
-| sing-box 1.14.3 | Shadowsocks 2022，320 TCP + 100 UDP，3 轮 | 0 | 94.2 MiB | 320 |
-| sing-box 1.14.3 | Trojan，150 TCP + 50 UDP，2 轮 | 0 | 38.2 MiB | 200 |
+1. **未补 6 小时测试**；本次集成版为一次 2 小时负载加 5 分钟恢复，不把旧版本的更长测试当作本版证明。
+2. **AnyTLS 已建 carrier 不被改密/删入站撤销**，仍能新开逻辑流，直到 carrier 关闭；新 carrier 按新配置认证。
+3. **`api` 与 `stats.file` 重载不是原子切换**。新端口/socket无法监听、统计文件被占用时只告警，不回滚已生效转发配置。
 
-这些不等同全面安全审计、长期稳定性或生产就绪保证。
+这些行为本版未修改。实验性 VLESS/Snell 代码保留但不属于正式支持承诺；不保证任意扩展/客户端组合兼容。
 
-**未验证：**
+## 验证范围与例外
 
-- 第三方客户端并发只用 sing-box 和 mihomo 测试过；没有用 Surge，也没有跨公网、真实延迟下的测试。
-- 没有在 2 GB 内存的机器上实测；内存结论来自测试机（约 8 GB 内存）上的进程 RSS 和按额度计算的上界。没有实测 4096 个会话同时在线时的内存。
-- `udp_targets`（单个关联多目标）和 `dials`（慢目标排队）的调大依据是代码分析，测试负载没有直接撞到它们；Kat 的 SOCKS5 入站没有单独做第三方并发测试。
-- Windows 实机运行（只做了交叉编译）。
-- 真实 GeoIP 库与公网规则集下载（只用了自制 mmdb 和本机 HTTPS 源）。
-- 长时间运行：0.6.2 发布后做过一次约 7 小时的本机回环浸泡（0.6.2 源码，仅额外启用本机诊断接口）：Shadowsocks 2022 与 AnyTLS 入站都使用默认额度，sing-box 1.14.3 作客户端，混合 TCP/UDP 负载，期间 4 次断开上游或强杀客户端，负载结束后再观察 30 分钟回落，没有发现内存、goroutine 或文件描述符泄漏。0.6.3 只改了默认值，没有重做浸泡。更长时间的运行和非回环环境下的运行没有验证。
-- 性能：本版本没有做性能测试，不作性能承诺。
-- 0.6.3 二进制没有重复 0.5.20 在 Debian 11 / glibc 2.31 上做过的静态二进制检查（构建方式相同）。
-- 随机证书模式只用 Kat 自己的 AnyTLS 出站、sing-box 和 mihomo（跳过证书校验，本机回环）作为客户端测试过；其他客户端没有测试。
+- 集成代码：全包 `go vet`、20 个包普通单元测试通过；重点 kernel/group 名称筛选的 race 通过，**非全部包 race**，provider 独立包未被筛选命中。
+- sing-box 1.14.3 与 mihomo v1.19.33：SS2022、AnyTLS、Trojan、SOCKS5，TCP/UDP，嗅探关/开两轮共 16 组。UDP 经代理查 `whoami.cloudflare` 核对出口，不只是 echo。
+- 一次本机回环混合负载 7200.220 秒，同一进程恢复 300.087 秒；SS2022/AnyTLS 的 TCP 长短流、UDP，239 次负载内 reload、160 次 provider 节点变更，旧流/新流各 320 次校验。客户端错误为空，goroutine 16→16、fd 15→15，HeapLive 采样峰约 64.38 MB、恢复约 6.06 MB，无 OOM。未见本场景下持续无界增长；不作性能或普遍无泄漏保证。外围观察器曾误报一次进程归属，正式测试控制器成功，独立清场已核实，不宣称全部工具退出码均零。
+- 发布准备另做精确版本、公开示例、只读配置兼容检查及少量 CLI 定向测试；不重跑长矩阵。
+- **未针对最终集成版重做**：全部包 race、Windows 构建/实机、真实 ACME 重新签发/续期、TFO 抓包、超过 4096 并发压力、全部规则/组/订阅矩阵及公网长时间延迟场景。分项历史证据不等于最终版本完整发布验收。上述检查不是一般安全审计。
 
 ## 附件与许可
 
-Release 附件：
+本次附件仅 Linux amd64：
 
-- `kat-0.6.3-linux-amd64`：Linux amd64 静态二进制（CGO_ENABLED=0，`-trimpath`）。不提供 Windows 二进制。
-- `kat-0.6.3-linux-amd64.sha256`：校验文件，使用 `sha256sum -c kat-0.6.3-linux-amd64.sha256` 校验。
-- `kat-0.6.3-third-party-licenses.txt`：第三方许可附件。
+- `kat-0.7.0-linux-amd64`
+- `kat-0.7.0-linux-amd64.sha256`（`<hash>  kat-0.7.0-linux-amd64`，与既有下载校验格式兼容）
+- `kat-0.7.0-third-party-licenses.txt`
 
-下载二进制时请同时保留 `kat-0.6.3-third-party-licenses.txt`。对应受许可源码及本地修改在本标签源码的 `third_party/reality/`、`patches/reality/`，其他原许可在 `third_party/licenses/`。REALITY 仍适用 MPL-2.0；juju/ratelimit 适用 LGPL-3.0 加静态/动态链接特别例外；maxminddb-golang v1.13.1 适用 ISC 许可。本版本没有新增第三方依赖。Kat 自研代码保留所有权利，没有顶层自研 LICENSE；该声明不替代或限制第三方原许可。
+Go 1.26.9，CGO 关闭，`-trimpath -buildvcs=false` 构建。源码标签为 `v0.7.0`。本地 REALITY replace、MPL 源码与补丁、LGPL 链接例外及其余第三方许可保留；Kat 自研代码仍保留所有权利，第三方许可赋予的权利不受影响。详见 [第三方说明](THIRD_PARTY_NOTICES.md) 和 [MPL 说明](MPL-NOTICE.md)。

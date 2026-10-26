@@ -1,0 +1,7 @@
+{"version": 1, "rules": [
+ {"domain": ["exact.example"], "domain_suffix": ["suffix.example", ".dot.example"], "domain_keyword": ["kw-test"], "domain_regex": ["^re[0-9]+\\.example$"]},
+ {"ip_cidr": ["203.0.113.0/24", "2001:db8:1::/48"]},
+ {"port": [8443], "port_range": ["9000:9010"], "network": ["udp"]},
+ {"type": "logical", "mode": "and", "rules": [{"domain_suffix": ["logic.example"]}, {"port": [443], "invert": true}]},
+ {"source_ip_cidr": ["192.0.2.0/24"], "domain": ["src.example"]}
+]}

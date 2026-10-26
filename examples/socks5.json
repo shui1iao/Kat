@@ -1,5 +1,6 @@
 {
   "inbounds": [{"protocol":"socks5", "listen":"127.0.0.1:10808", "users":[{"username":"example-user", "password":"replace-with-your-own-password"}]}],
   "udp_bind_ipv4":"127.0.0.1", "udp_bind_ipv6":"::1",
+  "security":{"allow_loopback":true},
   "limits":{"connections":64,"handshakes":8,"dials":8,"udp_associations":8,"udp_queue":4,"udp_targets":16,"buffer_size":16384,"pool_buffers":16,"handshake_timeout":"10s","dial_timeout":"5s","drain_timeout":"5s","udp_idle":"60s"}
 }

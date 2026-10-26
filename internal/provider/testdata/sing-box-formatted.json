@@ -1,0 +1,52 @@
+{
+  "outbounds": [
+    {
+      "type": "shadowsocks",
+      "tag": "VPS-0",
+      "server": "::1",
+      "server_port": 29301,
+      "method": "2022-blake3-aes-128-gcm",
+      "password": "AAECAwQFBgcICQoLDA0ODw=="
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "VPS-1",
+      "server": "::1",
+      "server_port": 29302,
+      "method": "aes-128-gcm",
+      "password": "测试+:/@密码"
+    },
+    {
+      "type": "anytls",
+      "tag": "VPS-2",
+      "server": "::1",
+      "server_port": 29303,
+      "tls": {
+        "enabled": true,
+        "insecure": true
+      },
+      "password": "测试+:/@密码"
+    },
+    {
+      "type": "trojan",
+      "tag": "VPS-3",
+      "server": "::1",
+      "server_port": 29304,
+      "password": "测试+:/@密码",
+      "tls": {
+        "enabled": true,
+        "server_name": "test.example"
+      }
+    },
+    {
+      "type": "socks",
+      "tag": "VPS-4",
+      "server": "::1",
+      "server_port": 29305,
+      "version": "5",
+      "username": "用户@:/+",
+      "password": "测试+:/@密码"
+    }
+  ]
+}
+

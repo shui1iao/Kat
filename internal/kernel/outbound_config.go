@@ -106,6 +106,29 @@ func (o *RuleSetConfig) UnmarshalJSON(b []byte) error {
 	*o = RuleSetConfig(p)
 	return nil
 }
+
+// GeositeConfig is the root "geosite" block (v2fly geosite.dat source).
+type GeositeConfig route.GeoIPOptions
+
+// ASNConfig is the root "asn" block (MaxMind DB with ASN records).
+type ASNConfig route.GeoIPOptions
+
+func (o *GeositeConfig) UnmarshalJSON(b []byte) error {
+	var p route.GeoIPOptions
+	if e := strictPlain(b, &p); e != nil {
+		return e
+	}
+	*o = GeositeConfig(p)
+	return nil
+}
+func (o *ASNConfig) UnmarshalJSON(b []byte) error {
+	var p route.GeoIPOptions
+	if e := strictPlain(b, &p); e != nil {
+		return e
+	}
+	*o = ASNConfig(p)
+	return nil
+}
 func (o *GeoIPConfig) UnmarshalJSON(b []byte) error {
 	var p route.GeoIPOptions
 	if e := strictPlain(b, &p); e != nil {
@@ -123,6 +146,18 @@ func validOutboundName(s string) bool {
 	}
 	for _, c := range s {
 		if unicode.IsControl(c) || unicode.IsSpace(c) || c == '=' {
+			return false
+		}
+	}
+	return true
+}
+
+func validProviderNodeName(s string) bool {
+	if s == "" || len(s) > 128 || !utf8.ValidString(s) {
+		return false
+	}
+	for _, c := range s {
+		if unicode.IsControl(c) {
 			return false
 		}
 	}
@@ -149,7 +184,9 @@ func (c *Config) routeOptions() route.Options {
 	if c.Routing != nil {
 		o.Final = c.Routing.Final
 		for _, r := range c.Routing.Rules {
-			o.Rules = append(o.Rules, route.Rule{Domain: r.Domain, DomainSuffix: r.DomainSuffix, DomainKeyword: r.DomainKeyword, IPCIDR: r.IPCIDR, SrcIPCIDR: r.SrcIPCIDR, GeoIP: r.GeoIP, DstPort: r.DstPort, Network: r.Network, RuleSet: r.RuleSet, NoResolve: r.NoResolve, Action: r.Action, Outbound: r.Outbound})
+			x := r.RouteRuleExt
+			o.Rules = append(o.Rules, route.Rule{Domain: r.Domain, DomainSuffix: r.DomainSuffix, DomainKeyword: r.DomainKeyword, IPCIDR: r.IPCIDR, SrcIPCIDR: r.SrcIPCIDR, GeoIP: r.GeoIP, DstPort: r.DstPort, Network: r.Network, RuleSet: r.RuleSet, NoResolve: r.NoResolve, Action: r.Action, Outbound: r.Outbound,
+				DomainRegex: x.DomainRegex, DomainWildcard: x.DomainWildcard, Geosite: x.Geosite, IPSuffix: x.IPSuffix, IPASN: x.IPASN, SrcIPASN: x.SrcIPASN, SrcGeoIP: x.SrcGeoIP, SrcPort: x.SrcPort, InPort: x.InPort, InName: x.InName, InType: x.InType, Protocol: x.Protocol, And: x.And, Or: x.Or, Not: x.Not})
 		}
 	}
 	for _, s := range c.RuleSets {
@@ -159,6 +196,14 @@ func (c *Config) routeOptions() route.Options {
 		g := route.GeoIPOptions(*c.GeoIP)
 		o.GeoIP = &g
 	}
+	if c.Geosite != nil {
+		g := route.GeoIPOptions(*c.Geosite)
+		o.Geosite = &g
+	}
+	if c.ASN != nil {
+		g := route.GeoIPOptions(*c.ASN)
+		o.ASN = &g
+	}
 	return o
 }
 
@@ -166,13 +211,17 @@ func (c *Config) routeOptions() route.Options {
 // graph. It never performs network I/O (protocol Validate may read a CA file).
 // On success c.route holds the normalized route.Options used by Start.
 func (c *Config) validateOutbounds() error {
-	if len(c.Outbounds) > maxOutbounds || len(c.Groups) > maxGroups {
+	if len(c.Outbounds)-c.providerNodes > maxOutbounds || len(c.Groups) > maxGroups {
 		return errors.New("too many outbounds or groups")
 	}
 	kind := map[string]byte{} // 'o' outbound, 'g' group
 	for i := range c.Outbounds {
 		o := outbound.Options(c.Outbounds[i])
-		if !validOutboundName(o.Name) || o.Name == "direct" || o.Name == "reject" || kind[o.Name] != 0 {
+		nameOK := validOutboundName(o.Name)
+		if i >= len(c.Outbounds)-c.providerNodes {
+			nameOK = validProviderNodeName(o.Name)
+		}
+		if !nameOK || o.Name == "direct" || o.Name == "reject" || kind[o.Name] != 0 {
 			return fmt.Errorf("outbound %d: invalid, reserved or duplicate name", i)
 		}
 		kind[o.Name] = 'o'
@@ -201,9 +250,35 @@ func (c *Config) validateOutbounds() error {
 			return fmt.Errorf("outbound %q: via refers to an unknown outbound", o.Name)
 		}
 	}
+	providers := map[string]bool{}
+	for _, p := range c.Providers {
+		providers[p.Name] = true
+		if p.Via != "" && !exists(p.Via, false) {
+			return fmt.Errorf("provider %q: unknown via", p.Name)
+		}
+	}
+	relays := map[string][]string{}
 	for _, g := range c.Groups {
+		for _, u := range g.Use {
+			if !providers[u] {
+				return fmt.Errorf("group %q: unknown provider %q", g.Name, u)
+			}
+		}
+		if g.Type == group.TypeRelay {
+			relays[g.Name] = g.Members
+			for _, m := range g.Members[1:] {
+				if kind[m] != 'o' {
+					return fmt.Errorf("relay %q: subsequent members must be protocol outbounds", g.Name)
+				}
+				for _, o := range c.Outbounds {
+					if o.Name == m && o.Via != "" {
+						return fmt.Errorf("relay %q: subsequent members cannot have via", g.Name)
+					}
+				}
+			}
+		}
 		for _, m := range g.Members {
-			if !exists(m, true) {
+			if !exists(m, true) && !(len(c.Providers) > 0 && !c.expanded && group.Options(g).Dynamic()) {
 				return fmt.Errorf("group %q: unknown member", g.Name)
 			}
 		}
@@ -246,6 +321,9 @@ func (c *Config) validateOutbounds() error {
 			}
 			d = max(d, depth[m])
 		}
+		if ms, ok := relays[n]; ok {
+			d = depth[ms[0]] + len(ms) - 1
+		}
 		if kind[n] == 'o' {
 			d++
 		}
@@ -274,6 +352,9 @@ func (c *Config) validateOutbounds() error {
 		if kind[name] == 0 {
 			return errors.New("routing refers to an unknown outbound or group")
 		}
+	}
+	if e := c.validateInboundRefs(ro); e != nil {
+		return e
 	}
 	c.route = ro
 	return nil

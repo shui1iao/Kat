@@ -39,6 +39,13 @@ type udpAssociation struct {
 	source      netip.Addr
 	proxies     map[string]*proxySession
 	proxyClosed bool
+	// Statistics: the association's flow and the route of each direct
+	// target (same lifetime as allowed, guarded by mu) for reply metering.
+	flow   *flow
+	routes map[netip.AddrPort]*udpRoute
+	// Sniffing (0.7.0): with override_destination a direct reply from the
+	// resolved address is reported from the client's original target.
+	reverse map[netip.AddrPort]Address
 }
 
 func (s *Server) resolve(ctx context.Context, a Address) (netip.AddrPort, error) {
@@ -50,13 +57,11 @@ func (s *Server) resolve(ctx context.Context, a Address) (netip.AddrPort, error)
 	}
 	ctx, cancel := context.WithTimeout(ctx, s.cfg.Limits.DialTimeout.value())
 	defer cancel()
-	select {
-	case s.dialSlots <- struct{}{}:
-	case <-ctx.Done():
-		return netip.AddrPort{}, ctx.Err()
+	if e := s.dialSlots.acquire(ctx); e != nil {
+		return netip.AddrPort{}, e
 	}
 	s.counters.Dials.Add(1)
-	defer func() { <-s.dialSlots; s.counters.Dials.Add(-1) }()
+	defer func() { s.dialSlots.release(); s.counters.Dials.Add(-1) }()
 	ips, e := net.DefaultResolver.LookupNetIP(ctx, "ip", a.Host)
 	if e != nil {
 		return netip.AddrPort{}, e
@@ -67,23 +72,26 @@ func (s *Server) resolve(ctx context.Context, a Address) (netip.AddrPort, error)
 	return netip.AddrPortFrom(ips[0].Unmap(), a.Port), nil
 }
 func (s *Server) serveUDP(c net.Conn, r request) error {
-	if !acquire(s.udpSlots) {
+	if !s.udpSlots.try() {
 		s.failure(failUDPBudget, "udp", -1)
 		_ = r.respond(c, nil, false)
 		return errors.New("UDP association limit")
 	}
 	s.counters.UDP.Add(1)
-	defer func() { <-s.udpSlots; s.counters.UDP.Add(-1) }()
+	defer func() { s.udpSlots.release(); s.counters.UDP.Add(-1) }()
 	parent := s.ctx
 	if r.Context != nil {
 		parent = r.Context
 	}
-	ctx, cancel := context.WithCancel(parent)
-	a := &udpAssociation{server: s, ctx: ctx, cancel: cancel, stream: c, req: r, queue: make(chan packet, s.cfg.Limits.UDPQueue), allowed: make(map[netip.AddrPort]time.Time)}
+	f, fparent := s.newFlow(parent, "udp", Address{})
+	ctx, cancel := context.WithCancel(fparent)
+	a := &udpAssociation{server: s, ctx: ctx, cancel: cancel, stream: c, req: r, queue: make(chan packet, s.cfg.Limits.UDPQueue), allowed: make(map[netip.AddrPort]time.Time), flow: f}
 	a.source = sourceOf(parent)
 	if !a.source.IsValid() {
 		a.source = addrIP(c.RemoteAddr())
 	}
+	f.setSource(a.source)
+	defer f.end("ok")
 	defer cancel()
 	var e error
 	a.outbound4, e = net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP(s.cfg.UDPBindIPv4)})
@@ -206,6 +214,12 @@ func (a *udpAssociation) enqueue(p packet) {
 }
 func (a *udpAssociation) nativeLoop() error {
 	b := make([]byte, 65535)
+	var frags *reassembly // created by the first fragment (FRAG != 0)
+	defer func() {
+		if frags != nil {
+			frags.close()
+		}
+	}()
 	for {
 		n, src, e := a.native.ReadFromUDPAddrPort(b)
 		if e != nil {
@@ -220,7 +234,7 @@ func (a *udpAssociation) nativeLoop() error {
 			a.server.failure(failUDPInvalid, "udp", -1)
 			continue
 		}
-		if n < 4 || b[0] != 0 || b[1] != 0 || b[2] != 0 {
+		if n < 4 || b[0] != 0 || b[1] != 0 {
 			a.server.counters.Dropped.Add(1)
 			a.server.failure(failUDPInvalid, "udp", -1)
 			continue
@@ -238,6 +252,19 @@ func (a *udpAssociation) nativeLoop() error {
 		}
 		a.mu.Unlock()
 		payload := append([]byte(nil), b[n-reader.Len():n]...)
+		if b[2] != 0 {
+			if frags == nil {
+				frags = a.newReassembly()
+			}
+			if frags == nil {
+				a.server.frags.dropped.Add(1)
+				continue
+			}
+			var ok bool
+			if target, payload, ok = frags.add(b[2], target, payload); !ok {
+				continue
+			}
+		}
 		a.enqueue(packet{target, payload})
 	}
 }
@@ -266,65 +293,112 @@ func (a *udpAssociation) sendLoop() {
 	idle := a.server.cfg.Limits.UDPIdle.value()
 	// Proxy sessions never outlive the association's sender.
 	defer a.closeProxies()
+	sn := a.newUDPSniffer()
 	for {
 		select {
 		case <-a.ctx.Done():
 			return
+		case <-sn.timerC():
+			sn.expire(a, time.Now(), idle)
 		case p := <-a.queue:
 			a.queuedBytes.Add(-int64(len(p.payload)))
-			candidates, proxy, host, e := a.server.routeUDP(a.ctx, p.target, a.source)
-			if e != nil {
-				a.server.counters.Dropped.Add(1)
-				a.server.resolutionFailure(e)
+			if sn != nil {
+				sn.packet(a, p, idle)
 				continue
 			}
-			if proxy != "" {
-				a.sendProxy(proxy, Address{host, p.target.Port}, p.payload)
-				continue
-			}
-			var target netip.AddrPort
-			var socket *net.UDPConn
-			for _, ip := range candidates {
-				sock := a.outbound4
-				if ip.Addr().Is6() {
-					sock = a.outbound6
-				}
-				if sock != nil {
-					target, socket = ip, sock
-					break
-				}
-			}
-			if socket == nil {
-				a.server.counters.Dropped.Add(1)
-				a.server.failure(failUDPInvalid, "udp", -1)
-				continue
-			}
-			now := time.Now()
-			a.mu.Lock()
-			for k, t := range a.allowed {
-				if now.Sub(t) > idle {
-					delete(a.allowed, k)
-				}
-			}
-			_, exists := a.allowed[target]
-			if !exists && len(a.allowed) >= a.server.cfg.Limits.UDPTargets {
-				a.mu.Unlock()
-				a.server.counters.Dropped.Add(1)
-				a.server.failure(failUDPTargets, "udp", -1)
-				continue
-			}
-			a.allowed[target] = now
-			a.mu.Unlock()
-			socket.SetWriteDeadline(now.Add(a.server.cfg.Limits.DialTimeout.value()))
-			if _, e = socket.WriteToUDPAddrPort(p.payload, target); e != nil {
-				a.server.counters.Dropped.Add(1)
-				a.server.failure(failUDPIO, "udp", -1)
-				continue
-			}
-			if !a.ssNative {
-				a.activity.Store(time.Now().UnixNano())
-			}
+			a.send(a.ctx, p, idle)
 		}
+	}
+}
+
+// send routes and forwards one datagram (ctx may carry a sniff result).
+func (a *udpAssociation) send(ctx context.Context, p packet, idle time.Duration) {
+	candidates, proxy, host, rule, e := a.server.routeUDP(ctx, p.target, a.source)
+	if e != nil {
+		if errors.Is(e, errRouteReject) {
+			a.flow.udpDecided(p.target, rule, []string{"reject"})
+		}
+		a.server.counters.Dropped.Add(1)
+		a.server.resolutionFailure(e)
+		return
+	}
+	overridden := sniffOf(ctx).target(p.target) != p.target
+	if proxy != "" {
+		dst := Address{host, p.target.Port}
+		if overridden {
+			// Replies through a proxy cannot be mapped back reliably:
+			// the outbound gets the original target.
+			dst = p.target
+		}
+		a.sendProxy(proxy, dst, p.payload, p.target, rule)
+		return
+	}
+	var target netip.AddrPort
+	var socket *net.UDPConn
+	blocked := false
+	for _, ip := range candidates {
+		if a.server.cfg.blockedDestination(ip.Addr()) {
+			blocked = true
+			return
+		}
+		sock := a.outbound4
+		if ip.Addr().Is6() {
+			sock = a.outbound6
+		}
+		if sock != nil {
+			target, socket = ip, sock
+			break
+		}
+	}
+	if socket == nil {
+		a.server.counters.Dropped.Add(1)
+		if blocked {
+			a.server.failure(failBlocked, "udp", -1)
+		} else {
+			a.server.failure(failUDPInvalid, "udp", -1)
+		}
+		return
+	}
+	rt := a.flow.udpDecided(p.target, rule, []string{"direct"})
+	now := time.Now()
+	a.mu.Lock()
+	for k, t := range a.allowed {
+		if now.Sub(t) > idle {
+			delete(a.allowed, k)
+			delete(a.routes, k)
+			delete(a.reverse, k)
+		}
+	}
+	_, exists := a.allowed[target]
+	if !exists && len(a.allowed) >= a.server.cfg.Limits.UDPTargets {
+		a.mu.Unlock()
+		a.server.counters.Dropped.Add(1)
+		a.server.failure(failUDPTargets, "udp", -1)
+		return
+	}
+	a.allowed[target] = now
+	if overridden {
+		if a.reverse == nil {
+			a.reverse = map[netip.AddrPort]Address{}
+		}
+		a.reverse[target] = p.target
+	}
+	if rt != nil {
+		if a.routes == nil {
+			a.routes = map[netip.AddrPort]*udpRoute{}
+		}
+		a.routes[target] = rt
+	}
+	a.mu.Unlock()
+	socket.SetWriteDeadline(now.Add(a.server.cfg.Limits.DialTimeout.value()))
+	if _, e = socket.WriteToUDPAddrPort(p.payload, target); e != nil {
+		a.server.counters.Dropped.Add(1)
+		a.server.failure(failUDPIO, "udp", -1)
+		return
+	}
+	a.flow.udpUp(rt, len(p.payload))
+	if !a.ssNative {
+		a.activity.Store(time.Now().UnixNano())
 	}
 }
 func (a *udpAssociation) returnLoop(socket *net.UDPConn) {
@@ -351,8 +425,19 @@ func (a *udpAssociation) returnLoop(socket *net.UDPConn) {
 		}
 		payload := b[:n]
 		source := Address{src.Addr().String(), src.Port()}
+		a.mu.Lock()
+		if o, ok := a.reverse[src]; ok {
+			source = o
+		}
+		a.mu.Unlock()
 		if e = a.output(client, source, payload, idle); e != nil {
 			return
+		}
+		if a.flow != nil {
+			a.mu.Lock()
+			rt := a.routes[src]
+			a.mu.Unlock()
+			a.flow.udpDown(rt, n)
 		}
 	}
 }

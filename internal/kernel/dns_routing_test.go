@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -61,13 +62,26 @@ func dnsReply(w []byte, ips []string, ttl uint32) []byte {
 }
 func newDNSFixture(t *testing.T, fn func([]byte) []byte) *dnsFixture {
 	t.Helper()
-	ln, e := net.Listen("tcp4", "127.0.0.1:0")
-	if e != nil {
-		t.Fatal(e)
-	}
-	u, e := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: ln.Addr().(*net.TCPAddr).Port})
-	if e != nil {
+	var ln net.Listener
+	var u *net.UDPConn
+	var e error
+	// TCP port 0 does not reserve the matching UDP port. An unrelated UDP
+	// socket may already use it; choose another pair only for EADDRINUSE.
+	for attempt := 0; attempt < 16; attempt++ {
+		ln, e = net.Listen("tcp4", "127.0.0.1:0")
+		if e != nil {
+			t.Fatal(e)
+		}
+		u, e = net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: ln.Addr().(*net.TCPAddr).Port})
+		if e == nil {
+			break
+		}
 		ln.Close()
+		if !errors.Is(e, syscall.EADDRINUSE) {
+			t.Fatal(e)
+		}
+	}
+	if e != nil {
 		t.Fatal(e)
 	}
 	f := &dnsFixture{udp: u, tcp: ln, fn: fn}
@@ -417,7 +431,7 @@ func TestDNSRoutingOrderedRulesAndLiteralTCPUDP(t *testing.T) {
 	u.WriteToUDP([]byte("reply"), out)
 	w, _ := recvUDP(t, client)
 	idleCheckResponse(t, true, w, "reply")
-	rt := s.ssListeners[0].runtime
+	rt := s.ssListeners[0].bind.Load().runtime
 	rt.mu.Lock()
 	assoc := rt.associations[ssAssociationID{session: 901}]
 	rt.mu.Unlock()
@@ -480,7 +494,7 @@ func TestDNSRoutingRejectUDPWhitelistAndNoFallback(t *testing.T) {
 	if queries.count.Load() != 0 {
 		t.Fatal("domain reject queried DNS")
 	}
-	rt := s.ssListeners[0].runtime
+	rt := s.ssListeners[0].bind.Load().runtime
 	rt.mu.Lock()
 	a := rt.associations[ssAssociationID{session: 920}]
 	rt.mu.Unlock()

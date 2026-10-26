@@ -98,7 +98,7 @@ type SSUDPReceiveBuffer struct {
 
 func (s *Server) SSUDPReceiveBuffers() []SSUDPReceiveBuffer {
 	var out []SSUDPReceiveBuffer
-	for _, u := range s.ssListeners {
+	for _, u := range s.current().ssListeners {
 		if u.rcvbufActual != 0 {
 			out = append(out, SSUDPReceiveBuffer{u.socket.LocalAddr().String(), u.rcvbufBefore, u.rcvbufActual, u.rcvbufInitial})
 		}

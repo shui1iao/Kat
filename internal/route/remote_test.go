@@ -141,6 +141,9 @@ func noTmp(t *testing.T, p string) {
 	if _, err := os.Stat(p + ".tmp"); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("temporary file left behind", err)
 	}
+	if m, _ := filepath.Glob(p + ".tmp*"); len(m) != 0 {
+		t.Fatal("temporary file left behind", m)
+	}
 }
 
 func TestRemoteFirstDownloadAtomicWriteViaDial(t *testing.T) {
@@ -421,4 +424,71 @@ func TestRemoteLifecycleAndConcurrentDecide(t *testing.T) {
 	org.srv.CloseClientConnections()
 	waitFor(t, 5*time.Second, "goroutines to return to baseline", func() bool { return runtime.NumGoroutine() <= baseline+2 })
 	t.Logf("swaps=%d goroutines baseline=%d now=%d", ev3.count("rule_set_loaded"), baseline, runtime.NumGoroutine())
+}
+
+// geosite and ASN sources use the same refresh machinery: interval updates
+// switch the data, failures keep the old data and file and emit an event.
+func TestRemoteGeositeAndASNRefreshAndFailure(t *testing.T) {
+	v1 := buildGeosite(map[string][]siteDom{"test": {{2, "one.example", nil}}})
+	v2 := buildGeosite(map[string][]siteDom{"test": {{2, "two.example", nil}}})
+	site := newOrigin(t, "")
+	site.set("", string(v1))
+	asnV1 := testASNDB(t)
+	asnV2 := buildMMDB(t, map[string]int{"1.1.1.0/24": 0}, []mmMap{{{"autonomous_system_number", mmU32(64999)}}})
+	asn := newOrigin(t, "")
+	asn.set("", string(asnV1))
+	dir := t.TempDir()
+	ev := &eventLog{}
+	o := Options{
+		Rules: []Rule{
+			{Geosite: "test", Outbound: "site"},
+			{IPASN: "13335", Outbound: "cf", NoResolve: true},
+			{IPASN: "64999", Outbound: "new", NoResolve: true},
+		},
+		Geosite: &GeoIPOptions{Path: filepath.Join(dir, "geosite.dat"), URL: site.srv.URL + "/geosite.dat"},
+		ASN:     &GeoIPOptions{Path: filepath.Join(dir, "asn.mmdb"), URL: asn.srv.URL + "/asn.mmdb"},
+	}
+	e, err := NewEngine(o, (&dialRecorder{}).dial, ev.sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := x509.NewCertPool()
+	pool.AddCert(site.srv.Certificate())
+	pool.AddCert(asn.srv.Certificate())
+	e.rootCAs = pool
+	e.backoffBase = 30 * time.Millisecond
+	e.fetchTimeout = 5 * time.Second
+	for _, s := range e.sources {
+		s.interval = 150 * time.Millisecond
+	}
+	t.Cleanup(func() { e.Close() })
+	e.Start(context.Background())
+	dns := &fakeDNS{ips: addrs("192.0.2.1")}
+	waitFor(t, 5*time.Second, "v1 loaded", func() bool {
+		d, _ := decideHost(t, e, "a.one.example", 443, dns)
+		return d.Outbound == "site" && decideIP(t, e, "1.1.1.1", 443).Outbound == "cf"
+	})
+	site.set("", string(v2))
+	asn.set("", string(asnV2))
+	waitFor(t, 5*time.Second, "v2 after interval", func() bool {
+		d, _ := decideHost(t, e, "a.two.example", 443, dns)
+		return d.Outbound == "site" && decideIP(t, e, "1.1.1.1", 443).Outbound == "new"
+	})
+	if d, _ := decideHost(t, e, "a.one.example", 443, dns); d.Outbound == "site" {
+		t.Fatal("old geosite still active")
+	}
+	site.set("html", "")
+	asn.set("html", "")
+	waitFor(t, 5*time.Second, "failures", func() bool {
+		return ev.count("geosite_update_failed", "class", "parse") >= 1 && ev.count("asn_update_failed", "class", "parse") >= 1
+	})
+	if d, _ := decideHost(t, e, "a.two.example", 443, dns); d.Outbound != "site" || decideIP(t, e, "1.1.1.1", 443).Outbound != "new" {
+		t.Fatal("old data lost after failed update")
+	}
+	if !bytes.Equal([]byte(readFile(t, o.Geosite.Path)), v2) || !bytes.Equal([]byte(readFile(t, o.ASN.Path)), asnV2) {
+		t.Fatal("old file replaced")
+	}
+	noTmp(t, o.Geosite.Path)
+	noTmp(t, o.ASN.Path)
+	t.Logf("events: %d geosite_loaded, %d asn_loaded, %d geosite_update_failed", ev.count("geosite_loaded"), ev.count("asn_loaded"), ev.count("geosite_update_failed"))
 }

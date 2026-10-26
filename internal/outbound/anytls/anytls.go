@@ -30,6 +30,7 @@ import (
 
 	A "github.com/shui1iao/Kat/internal/anytls"
 	"github.com/shui1iao/Kat/internal/outbound"
+	"github.com/shui1iao/Kat/internal/outbound/internal/tlsclient"
 )
 
 const (
@@ -86,6 +87,9 @@ func Validate(o outbound.Options) error {
 	if _, e := o.TLS.ClientConfig(o.ServerAddr().Host); e != nil {
 		return configError("invalid tls options")
 	}
+	if tlsclient.Validate(o.TLS.Fingerprint) != nil {
+		return configError("invalid tls.fingerprint")
+	}
 	return nil
 }
 
@@ -120,6 +124,7 @@ type Outbound struct {
 	server      outbound.Addr
 	digest      [32]byte
 	tls         *tls.Config
+	fp          string // uTLS fingerprint ("" = crypto/tls)
 	under       outbound.Dialer
 	udp         bool
 	idleMax     int
@@ -154,7 +159,7 @@ func New(o outbound.Options, under outbound.Dialer) (outbound.Outbound, error) {
 		return nil, e
 	}
 	ob := &Outbound{
-		name: o.Name, server: server, digest: sha256.Sum256([]byte(o.Password)), tls: tc, under: under,
+		name: o.Name, server: server, digest: sha256.Sum256([]byte(o.Password)), tls: tc, fp: o.TLS.Fingerprint, under: under,
 		udp: o.UDPEnabled(), idleMax: o.IdleSessions, idleTimeout: o.IdleTimeout.Value(),
 	}
 	if ob.idleMax == 0 {
@@ -420,8 +425,8 @@ func (o *Outbound) dialSession(ctx context.Context) (*session, error) {
 	if e != nil {
 		return nil, fmt.Errorf("anytls: dial server: %w", e)
 	}
-	tc := tls.Client(raw, o.tls)
-	if e = tc.HandshakeContext(ctx); e != nil {
+	tc, e := tlsclient.Handshake(ctx, raw, o.tls, o.fp)
+	if e != nil {
 		_ = raw.Close()
 		return nil, fmt.Errorf("anytls: tls handshake: %w", e)
 	}

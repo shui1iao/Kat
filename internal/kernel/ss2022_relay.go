@@ -20,7 +20,9 @@ func (w ss2022ReadActivity) Write(p []byte) (int, error) {
 	w.last.Store(time.Now().UnixNano())
 	return w.Writer.Write(p)
 }
-func (s *Server) copySS2022Up(dst, src net.Conn) error {
+func (s *Server) copySS2022Up(dst, src net.Conn) error { return s.copySS2022UpM(dst, src, meter{}) }
+
+func (s *Server) copySS2022UpM(dst, src net.Conn, m meter) error {
 	raw := src
 	var writer io.Writer = dst
 	if activity, ok := src.(*activityStream); ok {
@@ -29,11 +31,11 @@ func (s *Server) copySS2022Up(dst, src net.Conn) error {
 	}
 	if stream, ok := raw.(*encryptedStream); ok {
 		if codec, ok := stream.codec.(*ss.TCPConn); ok {
-			_, err := codec.Write2022To(writer, s.pool.size)
+			_, err := codec.Write2022To(m.writer(writer), s.pool.size)
 			return err
 		}
 	}
-	return s.copy(dst, src)
+	return s.copyM(dst, src, m)
 }
 
 // SS2022-only relay. Preserve relayIdle's half-close/drain/idle behavior, but
@@ -74,12 +76,13 @@ func (s *Server) relaySS2022(ctx context.Context, a, b net.Conn) error {
 	}
 
 	done := make(chan error, 2)
+	mUp, mDown := meters(ctx)
 	transfer := func(dst, src net.Conn, up bool) {
 		var e error
 		if up {
-			e = s.copySS2022Up(dst, src)
+			e = s.copySS2022UpM(dst, src, mUp)
 		} else {
-			e = s.copy(dst, src)
+			e = s.copyM(dst, src, mDown)
 		}
 		if e == nil {
 			e = closeWrite(dst)

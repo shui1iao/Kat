@@ -22,6 +22,15 @@ type Metadata struct {
 	IP      netip.Addr // valid when the destination is an IP literal
 	Port    uint16
 	Source  netip.Addr // client address
+
+	// Optional connection attributes (0.7.0): client source port, the
+	// inbound that accepted the connection and the sniffing result.
+	SrcPort   uint16
+	InPort    uint16
+	InName    string
+	InType    string
+	Protocol  string // sniffed: tls | http | quic
+	SniffHost string // sniffed domain; used for domain rules when IP is set
 }
 
 // Kind is the routing outcome class.
@@ -50,6 +59,9 @@ type Decision struct {
 	Kind       Kind
 	Outbound   string       // Kind==Proxy: outbound or group name; the original Host is handed to it
 	Candidates []netip.Addr // Kind==Direct: allowed IPs in resolver order; an IP target is itself
+	// Rule identifies the deciding rule for statistics: the 1-based index into
+	// Options.Rules, 0 for final, -1 for a built-in refusal (zone/empty target).
+	Rule int
 }
 
 // Resolver resolves a domain name for IP rules and direct dialing.
@@ -69,30 +81,12 @@ var (
 type verdict struct {
 	kind Kind
 	out  string
+	rule int // 1-based rule index, 0 = final
 }
 
-type matchKind uint8
-
-const (
-	mDomain matchKind = iota
-	mSuffix
-	mKeyword
-	mIPCIDR
-	mSrcIPCIDR
-	mGeoIP
-	mPort
-	mNetwork
-	mRuleSet
-)
-
 type compiledRule struct {
-	kind      matchKind
-	s         string
-	prefix    netip.Prefix
-	lo, hi    uint16
-	set       *ruleSet
-	noResolve bool
-	v         verdict
+	c *cond
+	v verdict
 }
 
 type ruleSet struct {
@@ -111,7 +105,9 @@ type Engine struct {
 	rules   []compiledRule
 	final   verdict
 	sets    []*ruleSet
-	geo     *geoSource // nil when no geoip block
+	geo     *geoSource  // nil when no geoip block
+	asn     *asnSource  // nil when no asn block
+	site    *siteSource // nil when no geosite block
 	sources []*source
 	dial    func(via string) (DialFunc, error)
 	events  outbound.EventSink
@@ -141,16 +137,22 @@ func toVerdict(action, out string) verdict {
 	return verdict{kind: Proxy, out: out}
 }
 
-// NewEngine validates o (on a copy), loads existing local rule-set and GeoIP
-// files and never blocks on downloads. A missing or invalid local file starts
-// that source empty and emits a *_update_failed event. dial maps a via name to
-// the DialContext used for downloads; it is required when any url is set.
+// NewEngine validates o (on a copy), loads existing local rule-set, GeoIP,
+// geosite and ASN files and never blocks on downloads. A missing or invalid
+// local file starts that source empty and emits a *_update_failed event. dial
+// maps a via name to the DialContext used for downloads; it is required when
+// any url is set.
 func NewEngine(o Options, dial func(via string) (func(ctx context.Context, network, addr string) (net.Conn, error), error), events outbound.EventSink) (*Engine, error) {
 	o.Rules = append([]Rule(nil), o.Rules...)
+	for i := range o.Rules {
+		o.Rules[i] = cloneRule(o.Rules[i])
+	}
 	o.RuleSets = append([]RuleSetOptions(nil), o.RuleSets...)
-	if o.GeoIP != nil {
-		g := *o.GeoIP
-		o.GeoIP = &g
+	for _, p := range []**GeoIPOptions{&o.GeoIP, &o.Geosite, &o.ASN} {
+		if *p != nil {
+			g := **p
+			*p = &g
+		}
 	}
 	if e := o.Validate(); e != nil {
 		return nil, e
@@ -163,17 +165,19 @@ func NewEngine(o Options, dial func(via string) (func(ctx context.Context, netwo
 		fetchTimeout: 60 * time.Second,
 		now:          time.Now,
 	}
+	env := parseEnv{geoip: o.GeoIP != nil, asn: o.ASN != nil, geosite: o.Geosite != nil}
 	byName := map[string]*ruleSet{}
 	for _, so := range o.RuleSets {
 		if so.URL != "" && dial == nil {
 			return nil, errf("rule set %q: url requires a dial function", so.Name)
 		}
 		rs := &ruleSet{}
-		format := so.Format
+		format, behavior := so.Format, so.Behavior
 		rs.src = &source{
 			kind: "rule_set", name: so.Name, path: so.Path, url: so.URL, via: so.Via,
 			maxBytes: so.MaxBytes, interval: so.Interval.Value(),
-			parse: func(b []byte) (any, error) { return parseRuleSet(format, b, setEntryLimit) },
+			stamp: "rule_set|" + format + "|" + behavior + "|" + env.String(),
+			parse: func(b []byte) (any, error) { return parseRuleSetAs(format, behavior, b, setEntryLimit, env) },
 			check: func(v any) error {
 				n := v.(*setData).entries
 				for _, other := range e.sets {
@@ -194,7 +198,7 @@ func NewEngine(o Options, dial func(via string) (func(ctx context.Context, netwo
 				e.events.Emit("rule_set_loaded", "name", so.Name, "entries", itoa(d.entries), "skipped", itoa(d.skipped))
 			},
 		}
-		rs.data.Store(&setData{})
+		rs.data.Store(&setData{mono: true})
 		e.sets = append(e.sets, rs)
 		e.sources = append(e.sources, rs.src)
 		byName[so.Name] = rs
@@ -206,6 +210,7 @@ func NewEngine(o Options, dial func(via string) (func(ctx context.Context, netwo
 		gs := &geoSource{}
 		gs.src = &source{
 			kind: "geoip", path: g.Path, url: g.URL, via: g.Via, maxBytes: g.MaxBytes, interval: g.Interval.Value(),
+			stamp: "geoip",
 			parse: func(b []byte) (any, error) { return parseGeoIP(b) },
 			check: func(any) error { return nil },
 			swap: func(v any) {
@@ -216,31 +221,56 @@ func NewEngine(o Options, dial func(via string) (func(ctx context.Context, netwo
 		e.geo = gs
 		e.sources = append(e.sources, gs.src)
 	}
-	for _, r := range o.Rules {
-		c := compiledRule{v: toVerdict(r.Action, r.Outbound), noResolve: r.NoResolve}
-		switch {
-		case r.Domain != "":
-			c.kind, c.s = mDomain, r.Domain
-		case r.DomainSuffix != "":
-			c.kind, c.s = mSuffix, r.DomainSuffix
-		case r.DomainKeyword != "":
-			c.kind, c.s = mKeyword, r.DomainKeyword
-		case r.IPCIDR != "":
-			c.kind = mIPCIDR
-			c.prefix, _ = parseCIDR(r.IPCIDR, false)
-		case r.SrcIPCIDR != "":
-			c.kind = mSrcIPCIDR
-			c.prefix, _ = parseCIDR(r.SrcIPCIDR, false)
-		case r.GeoIP != "":
-			c.kind, c.s = mGeoIP, r.GeoIP
-		case r.DstPort != "":
-			c.kind = mPort
-			c.lo, c.hi, _ = parsePortRange(r.DstPort)
-		case r.Network != "":
-			c.kind, c.s = mNetwork, r.Network
-		case r.RuleSet != "":
-			c.kind, c.set = mRuleSet, byName[r.RuleSet]
+	if g := o.ASN; g != nil {
+		if g.URL != "" && dial == nil {
+			return nil, errf("asn: url requires a dial function")
 		}
+		as := &asnSource{}
+		as.src = &source{
+			kind: "asn", path: g.Path, url: g.URL, via: g.Via, maxBytes: g.MaxBytes, interval: g.Interval.Value(),
+			stamp: "asn",
+			parse: func(b []byte) (any, error) { return parseASNDB(b) },
+			check: func(any) error { return nil },
+			swap: func(v any) {
+				as.db.Store(v.(*asnDB))
+				e.events.Emit("asn_loaded")
+			},
+		}
+		e.asn = as
+		e.sources = append(e.sources, as.src)
+	}
+	if g := o.Geosite; g != nil {
+		if g.URL != "" && dial == nil {
+			return nil, errf("geosite: url requires a dial function")
+		}
+		refs := geositeRefs(o.Rules)
+		ss := &siteSource{}
+		ss.src = &source{
+			kind: "geosite", path: g.Path, url: g.URL, via: g.Via, maxBytes: g.MaxBytes, interval: g.Interval.Value(),
+			stamp: "geosite",
+			parse: func(b []byte) (any, error) { return parseGeositeDB(b) },
+			check: func(any) error { return nil },
+			swap: func(v any) {
+				db := v.(*siteDB)
+				// Compile the categories the rules use now, outside Decide.
+				missing := 0
+				for _, r := range refs {
+					if m := db.matcher(r); m == nil || m.missing {
+						missing++
+						e.events.Emit("geosite_category_missing", "category", r)
+					}
+				}
+				ss.db.Store(db)
+				e.events.Emit("geosite_loaded", "categories", itoa(len(db.index)), "missing", itoa(missing))
+			},
+		}
+		e.site = ss
+		e.sources = append(e.sources, ss.src)
+	}
+	for i := range o.Rules {
+		r := &o.Rules[i]
+		c := compiledRule{c: compileRule(r, byName), v: toVerdict(r.Action, r.Outbound)}
+		c.v.rule = i + 1
 		e.rules = append(e.rules, c)
 	}
 	e.mu.Lock()
@@ -252,13 +282,6 @@ func NewEngine(o Options, dial func(via string) (func(ctx context.Context, netwo
 }
 
 // ---- Decide ----
-
-// ipInfo memoizes the GeoIP country of one candidate during one evaluation.
-type ipInfo struct {
-	ip      netip.Addr
-	geo     string
-	geoDone bool
-}
 
 func (e *Engine) country(x *ipInfo) string {
 	if !x.geoDone {
@@ -285,83 +308,23 @@ func (e *Engine) geoUsable(code string) bool {
 }
 
 type query struct {
-	host    string
-	port    uint16
-	network string
-	src     netip.Addr
+	host     string
+	port     uint16
+	network  string
+	src      netip.Addr
+	srcPort  uint16
+	inPort   uint16
+	inName   string
+	inType   string
+	protocol string
+	srcMemo  *ipInfo
 }
 
-// matchStatic evaluates the rule without a destination IP. For a rule set it
-// is the domain/port part only.
-func (r *compiledRule) matchStatic(q *query) bool {
-	switch r.kind {
-	case mDomain:
-		return q.host != "" && q.host == r.s
-	case mSuffix:
-		return q.host != "" && (q.host == r.s || len(q.host) > len(r.s) && strings.HasSuffix(q.host, r.s) && q.host[len(q.host)-len(r.s)-1] == '.')
-	case mKeyword:
-		return q.host != "" && strings.Contains(q.host, r.s)
-	case mSrcIPCIDR:
-		return q.src.IsValid() && r.prefix.Contains(q.src)
-	case mPort:
-		return q.port >= r.lo && q.port <= r.hi
-	case mNetwork:
-		return q.network == r.s
-	case mRuleSet:
-		return r.set.data.Load().matchStatic(q.host, q.port)
+func (q *query) srcInfo() *ipInfo {
+	if q.srcMemo == nil {
+		q.srcMemo = &ipInfo{ip: q.src}
 	}
-	return false
-}
-
-// needsIP reports whether a domain target must be resolved before this rule
-// can be decided (IP condition without no_resolve that can match now).
-func (e *Engine) needsIP(r *compiledRule) bool {
-	if r.noResolve {
-		return false
-	}
-	switch r.kind {
-	case mIPCIDR:
-		return true
-	case mGeoIP:
-		return e.geoUsable(r.s)
-	case mRuleSet:
-		d := r.set.data.Load()
-		if !d.ip.empty() {
-			return true
-		}
-		for _, c := range d.geo {
-			if e.geoUsable(c) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// matchIP evaluates the IP part of the rule against a known destination IP.
-func (e *Engine) matchIP(r *compiledRule, x *ipInfo) bool {
-	switch r.kind {
-	case mIPCIDR:
-		return r.prefix.Contains(x.ip)
-	case mGeoIP:
-		return e.geoMatch(r.s, x)
-	case mRuleSet:
-		d := r.set.data.Load()
-		if d.ip.contains(x.ip) || d.ipNR.contains(x.ip) {
-			return true
-		}
-		for _, c := range d.geo {
-			if e.geoMatch(c, x) {
-				return true
-			}
-		}
-		for _, c := range d.geoNR {
-			if e.geoMatch(c, x) {
-				return true
-			}
-		}
-	}
-	return false
+	return q.srcMemo
 }
 
 // eval is ordered first match from rule index start; x == nil means no IP is
@@ -369,7 +332,7 @@ func (e *Engine) matchIP(r *compiledRule, x *ipInfo) bool {
 func (e *Engine) eval(q *query, start int, x *ipInfo) verdict {
 	for i := start; i < len(e.rules); i++ {
 		r := &e.rules[i]
-		if r.matchStatic(q) || x != nil && e.matchIP(r, x) {
+		if e.match(r.c, q, x) {
 			return r.v
 		}
 	}
@@ -377,14 +340,15 @@ func (e *Engine) eval(q *query, start int, x *ipInfo) verdict {
 }
 
 // preDNS evaluates a domain target until the first rule that needs an IP.
-// It returns the verdict and -1, or the index of that rule.
+// It returns the verdict and -1, or the index of that rule. A rule that needs
+// an IP is still decided by its domain part when that cannot be undone by the
+// IP (monotone), as for a rule set holding both domains and CIDRs.
 func (e *Engine) preDNS(q *query) (verdict, int) {
 	for i := range e.rules {
-		r := &e.rules[i]
-		if r.matchStatic(q) {
-			return r.v, -1
-		}
-		if e.needsIP(r) {
+		switch e.tri(e.rules[i].c, q) {
+		case triTrue:
+			return e.rules[i].v, -1
+		case triUnknown:
 			return verdict{}, i
 		}
 	}
@@ -434,23 +398,29 @@ func dedupe(ips []netip.Addr) []netip.Addr {
 
 func toDecision(v verdict) Decision {
 	if v.kind == Proxy {
-		return Decision{Kind: Proxy, Outbound: v.out}
+		return Decision{Kind: Proxy, Outbound: v.out, Rule: v.rule}
 	}
-	return Decision{Kind: v.kind}
+	return Decision{Kind: v.kind, Rule: v.rule}
 }
 
 // Decide routes one destination. See the README routing section for the full
 // semantics; in short: ordered first match, domain rules before the first IP
 // rule decide without DNS, otherwise one resolution and per-candidate first
-// match where the first non-reject candidate decides.
+// match where the first non-reject candidate decides. For an IP destination a
+// sniffed domain (SniffHost) is used by the domain conditions.
 func (e *Engine) Decide(ctx context.Context, m Metadata, resolve Resolver) (Decision, error) {
-	q := query{port: m.Port, network: m.Network}
+	q := query{port: m.Port, network: m.Network, srcPort: m.SrcPort, inPort: m.InPort, inName: m.InName, inType: m.InType, protocol: m.Protocol}
 	if m.Source.IsValid() {
 		q.src = m.Source.WithZone("").Unmap()
 	}
 	if m.IP.IsValid() {
 		if m.IP.Zone() != "" {
-			return Decision{Kind: Reject}, nil
+			return Decision{Kind: Reject, Rule: -1}, nil
+		}
+		if m.SniffHost != "" {
+			if h, ok := normDomain(m.SniffHost); ok {
+				q.host = h
+			}
 		}
 		ip := m.IP.Unmap()
 		v := e.eval(&q, 0, &ipInfo{ip: ip})
@@ -462,7 +432,7 @@ func (e *Engine) Decide(ctx context.Context, m Metadata, resolve Resolver) (Deci
 	}
 	q.host = strings.ToLower(strings.TrimSuffix(m.Host, "."))
 	if q.host == "" {
-		return Decision{Kind: Reject}, errors.New("route: empty destination")
+		return Decision{Kind: Reject, Rule: -1}, errors.New("route: empty destination")
 	}
 	v, stop := e.preDNS(&q)
 	if stop < 0 {
@@ -471,24 +441,28 @@ func (e *Engine) Decide(ctx context.Context, m Metadata, resolve Resolver) (Deci
 		}
 		ips, err := e.lookup(ctx, resolve, q.host)
 		if err != nil {
-			return Decision{Kind: Direct}, err
+			return Decision{Kind: Direct, Rule: v.rule}, err
 		}
-		return Decision{Kind: Direct, Candidates: dedupe(ips)}, nil
+		return Decision{Kind: Direct, Candidates: dedupe(ips), Rule: v.rule}, nil
 	}
 	ips, err := e.lookup(ctx, resolve, q.host)
 	if err != nil {
 		// IP conditions cannot match; a non-direct outcome still applies.
 		v = e.eval(&q, stop, nil)
 		if v.kind == Direct {
-			return Decision{Kind: Direct}, err
+			return Decision{Kind: Direct, Rule: v.rule}, err
 		}
 		return toDecision(v), nil
 	}
 	var first *verdict
 	var direct []netip.Addr
+	rejectRule := -1
 	for _, ip := range ips {
 		c := e.eval(&q, stop, &ipInfo{ip: ip})
 		if c.kind == Reject {
+			if rejectRule < 0 {
+				rejectRule = c.rule
+			}
 			continue
 		}
 		if first == nil {
@@ -500,9 +474,9 @@ func (e *Engine) Decide(ctx context.Context, m Metadata, resolve Resolver) (Deci
 	}
 	switch {
 	case first == nil:
-		return Decision{Kind: Reject}, nil
+		return Decision{Kind: Reject, Rule: rejectRule}, nil
 	case first.kind == Direct:
-		return Decision{Kind: Direct, Candidates: dedupe(direct)}, nil
+		return Decision{Kind: Direct, Candidates: dedupe(direct), Rule: first.rule}, nil
 	}
 	return toDecision(*first), nil
 }

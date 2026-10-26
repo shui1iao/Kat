@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/shui1iao/Kat/internal/outbound"
+	"github.com/shui1iao/Kat/internal/outbound/internal/tlsclient"
 )
 
 const typeName = "trojan"
@@ -62,6 +63,9 @@ func parse(o outbound.Options) (*tls.Config, error) {
 	if e != nil {
 		return nil, fmt.Errorf("%w: %v", errOptions, e)
 	}
+	if e := tlsclient.Validate(o.TLS.Fingerprint); e != nil {
+		return nil, fmt.Errorf("%w: %v", errOptions, e)
+	}
 	return c, nil
 }
 
@@ -99,6 +103,7 @@ type Outbound struct {
 	server outbound.Addr
 	auth   [56]byte
 	tls    *tls.Config
+	fp     string // uTLS fingerprint ("" = crypto/tls)
 	udp    bool
 	under  outbound.Dialer
 }
@@ -114,7 +119,7 @@ func New(o outbound.Options, under outbound.Dialer) (outbound.Outbound, error) {
 	if under == nil {
 		return nil, fmt.Errorf("%w: nil under dialer", errOptions)
 	}
-	t := &Outbound{name: o.Name, server: o.ServerAddr(), tls: c, udp: o.UDPEnabled(), under: under}
+	t := &Outbound{name: o.Name, server: o.ServerAddr(), tls: c, fp: o.TLS.Fingerprint, udp: o.UDPEnabled(), under: under}
 	sum := sha256.Sum224([]byte(o.Password))
 	hex.Encode(t.auth[:], sum[:])
 	return t, nil
@@ -151,13 +156,13 @@ func (t *Outbound) request(cmd byte, dst outbound.Addr) ([]byte, error) {
 	return append(b, '\r', '\n'), nil
 }
 
-func (t *Outbound) handshake(ctx context.Context) (*tls.Conn, error) {
+func (t *Outbound) handshake(ctx context.Context) (net.Conn, error) {
 	raw, e := t.under.DialTCP(ctx, t.server)
 	if e != nil {
 		return nil, e
 	}
-	c := tls.Client(raw, t.tls)
-	if e = c.HandshakeContext(ctx); e != nil {
+	c, e := tlsclient.Handshake(ctx, raw, t.tls, t.fp)
+	if e != nil {
 		raw.Close()
 		return nil, e
 	}
@@ -247,7 +252,7 @@ func (c *conn) CloseWrite() error {
 	if e := c.ensureSent(); e != nil {
 		return e
 	}
-	return c.Conn.(*tls.Conn).CloseWrite()
+	return c.Conn.(interface{ CloseWrite() error }).CloseWrite()
 }
 
 // ListenPacket opens a UDP ASSOCIATE over a new TLS stream. The request
@@ -265,7 +270,7 @@ func (t *Outbound) ListenPacket(ctx context.Context) (outbound.PacketConn, error
 
 type packetConn struct {
 	t    *Outbound
-	c    *tls.Conn
+	c    net.Conn
 	wmu  sync.Mutex
 	sent bool
 	r    *bufio.Reader

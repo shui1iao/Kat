@@ -15,6 +15,7 @@ import (
 	XH "github.com/shui1iao/Kat/internal/xhttp"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"time"
 )
@@ -33,7 +34,8 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 	*d = Duration(v)
 	return nil
 }
-func (d Duration) value() time.Duration { return time.Duration(d) }
+func (d Duration) MarshalJSON() ([]byte, error) { return json.Marshal(time.Duration(d).String()) }
+func (d Duration) value() time.Duration         { return time.Duration(d) }
 
 type User struct {
 	Flow     string `json:"flow,omitempty"`
@@ -44,6 +46,15 @@ type User struct {
 type TLSConfig struct {
 	Cert string `json:"cert"`
 	Key  string `json:"key"`
+	// 0.7.0 (Trojan/AnyTLS inbounds only, all optional): see tls_config.go.
+	Certificates  []TLSCertFile `json:"certificates,omitempty"`
+	Watch         bool          `json:"watch,omitempty"`
+	WatchInterval Duration      `json:"watch_interval,omitempty"`
+	ALPN          []string      `json:"alpn,omitempty"`
+	MinVersion    string        `json:"min_version,omitempty"`
+	MaxVersion    string        `json:"max_version,omitempty"`
+	CipherSuites  []string      `json:"cipher_suites,omitempty"`
+	ACME          *ACMEConfig   `json:"acme,omitempty"`
 }
 type Inbound struct {
 	logIndex      int
@@ -63,14 +74,29 @@ type Inbound struct {
 	ssRuntime     *ssRuntime
 	snellServer   *snell.Server
 	tlsConfig     *tls.Config
+	TCPFastOpen   bool       `json:"tcp_fast_open,omitempty"`
+	serverTLS     *serverTLS // Trojan/AnyTLS certificate sources (tls_config.go)
+	// Codec configurations, compared by a reload to reuse identical codecs.
+	xhttpConf  XH.Config
+	anytlsConf A.Config
+	snellConf  snell.Config
 	// tlsWritten: the JSON object had a "tls" member (even null).
 	// ephemeralTLS: tlsConfig holds a generated in-memory certificate.
 	tlsWritten   bool
 	ephemeralTLS bool
+	// 0.7.0: source lists (all inbounds), Trojan fallback, SOCKS5 options.
+	Sources           *SourceOptions `json:"sources,omitempty"`
+	Fallback          string         `json:"fallback,omitempty"`
+	SOCKS5            *SOCKS5Options `json:"socks5,omitempty"`
+	srcAllow, srcDeny []netip.Prefix
 	// anytlsSessionsAuto is the max_sessions value Validate derived from
 	// limits.connections for an omitted/0 AnyTLS max_sessions (0 = written
 	// explicitly). Like Limits.logicalAuto, re-validation derives it again.
 	anytlsSessionsAuto int
+
+	// 0.7.0: optional name (in_name rules) and per-inbound traffic sniffing.
+	Name  string        `json:"name,omitempty"`
+	Sniff *SniffOptions `json:"sniff,omitempty"`
 }
 type Limits struct {
 	LogicalStreams   int      `json:"logical_streams"`
@@ -89,6 +115,7 @@ type Limits struct {
 	TCPIdle          Duration `json:"tcp_idle"`
 	UDPIdle          Duration `json:"udp_idle"`
 	DisableFastPath  bool     `json:"disable_fast_path"`
+	UDPFragmentBytes int      `json:"udp_fragment_bytes,omitempty"` // 0.7.0: SOCKS5 UDP reassembly, all associations
 	// logicalAuto is the value Validate derived for an omitted/0
 	// logical_streams (0 = written explicitly). While LogicalStreams still
 	// holds that value, re-validation recomputes it as
@@ -118,11 +145,28 @@ type Config struct {
 	Limits      Limits          `json:"limits"`
 
 	// Routing core (all optional; absent = system DNS + direct as before).
-	Outbounds []OutboundConfig `json:"outbounds,omitempty"`
-	Groups    []GroupConfig    `json:"groups,omitempty"`
-	RuleSets  []RuleSetConfig  `json:"rule_sets,omitempty"`
-	GeoIP     *GeoIPConfig     `json:"geoip,omitempty"`
-	route     route.Options    // normalized by Validate
+	Providers     []ProviderConfig `json:"providers,omitempty"`
+	providerNodes int
+	expanded      bool
+	raw           []byte
+	defaults      [2]string
+	stateDir      string           // default ACME storage root, retained for provider rebuilds
+	Outbounds     []OutboundConfig `json:"outbounds,omitempty"`
+	Groups        []GroupConfig    `json:"groups,omitempty"`
+	RuleSets      []RuleSetConfig  `json:"rule_sets,omitempty"`
+	GeoIP         *GeoIPConfig     `json:"geoip,omitempty"`
+	Geosite       *GeositeConfig   `json:"geosite,omitempty"`
+	ASN           *ASNConfig       `json:"asn,omitempty"`
+	route         route.Options    // normalized by Validate
+
+	// Runtime (0.7.0, all optional).
+	Log      *LogOptions      `json:"log,omitempty"`
+	Stats    *StatsOptions    `json:"stats,omitempty"`
+	API      *APIOptions      `json:"api,omitempty"`
+	Security *SecurityOptions `json:"security,omitempty"`
+
+	// 0.7.0: built-in direct outbound options (optional).
+	Direct *DirectOptions `json:"direct,omitempty"`
 }
 
 func Load(path string) (Config, error) {
@@ -136,21 +180,33 @@ func Load(path string) (Config, error) {
 	if e != nil || len(b) > 1<<20 {
 		return c, errors.New("configuration exceeds 1 MiB or cannot be read")
 	}
+	return decodeConfig(b)
+}
+
+func decodeConfig(b []byte) (Config, error) {
+	var c Config
 	d := json.NewDecoder(bytes.NewReader(b))
 	d.DisallowUnknownFields()
-	if e = d.Decode(&c); e != nil {
+	if e := d.Decode(&c); e != nil {
 		return c, errors.New("invalid configuration JSON or unknown field")
 	}
-	if e = d.Decode(new(any)); e != io.EOF {
+	if e := d.Decode(new(any)); e != io.EOF {
 		return c, errors.New("trailing configuration data")
 	}
+	c.raw = append([]byte(nil), b...)
 	return c, c.Validate()
 }
 func (c *Config) Validate() error {
+	if e := c.validateProviders(); e != nil {
+		return e
+	}
 	if e := c.validateNetwork(); e != nil {
 		return e
 	}
 	if e := c.validateOutbounds(); e != nil {
+		return e
+	}
+	if e := c.validateRuntime(); e != nil {
 		return e
 	}
 	for _, b := range []struct {
@@ -372,7 +428,14 @@ func (c *Config) Validate() error {
 		default:
 			return errors.New("unsupported inbound protocol")
 		}
-		if in.TLS != nil {
+		if in.TLS != nil && (in.Protocol == "trojan" || in.Protocol == "anytls") {
+			if e := in.validateServerTLS(); e != nil {
+				return e
+			}
+		} else if in.TLS != nil {
+			if in.TLS.extended() {
+				return errors.New("extended TLS options apply to Trojan and AnyTLS inbounds only")
+			}
 			cert, e := tls.LoadX509KeyPair(in.TLS.Cert, in.TLS.Key)
 			if e != nil {
 				return errors.New("cannot load TLS certificate/key")
@@ -407,6 +470,9 @@ func (c *Config) Validate() error {
 			}
 			in.tlsConfig, in.ephemeralTLS = cfg, true
 		}
+	}
+	if e := c.validateSecurity(); e != nil {
+		return e
 	}
 	seenAny := map[string]AnyTLSOptions{}
 	seenSS := map[string]SSOptions{}

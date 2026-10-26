@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"os"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/shui1iao/Kat/internal/outbound"
@@ -26,6 +27,15 @@ type Options struct {
 	// one WriteTo domain resolution. Zero means only the caller's ctx applies
 	// (resolution inside WriteTo then uses a 5s bound).
 	Timeout time.Duration
+	// Guard, when set, is asked for every resolved destination address of a
+	// DialTCP and of every datagram of a PacketConn (with the ctx given to
+	// DialTCP / ListenPacket). Returning true refuses that address with
+	// ErrBlocked. The kernel uses it to keep proxied client traffic away from
+	// local addresses; Kat's own traffic (probes, downloads) is never refused.
+	Guard func(ctx context.Context, ip netip.Addr) bool
+	// Control, when set, is the net.Dialer ControlContext of TCP dials (the
+	// kernel uses it for TCP Fast Open).
+	Control func(ctx context.Context, network, address string, c syscall.RawConn) error
 }
 
 // Outbound implements outbound.Outbound for direct connections.
@@ -40,6 +50,9 @@ func (d *Outbound) Name() string { return "direct" }
 func (d *Outbound) Type() string { return "direct" }
 func (d *Outbound) UDP() bool    { return true }
 func (d *Outbound) Close() error { return nil }
+
+// ErrBlocked: every address of the destination was refused by Options.Guard.
+var ErrBlocked = errors.New("direct: destination address not allowed")
 
 var (
 	errZeroPort   = errors.New("direct: zero destination port")
@@ -90,9 +103,21 @@ func (d *Outbound) DialTCP(ctx context.Context, dst outbound.Addr) (net.Conn, er
 	if e != nil {
 		return nil, e
 	}
+	if d.o.Guard != nil {
+		allowed := ips[:0:0]
+		for _, ip := range ips {
+			if !d.o.Guard(ctx, ip) {
+				allowed = append(allowed, ip)
+			}
+		}
+		if len(allowed) == 0 {
+			return nil, ErrBlocked
+		}
+		ips = allowed
+	}
 	var last error
 	for _, ip := range ips {
-		c, e := (&net.Dialer{}).DialContext(ctx, "tcp", netip.AddrPortFrom(ip, dst.Port).String())
+		c, e := (&net.Dialer{ControlContext: d.o.Control}).DialContext(ctx, "tcp", netip.AddrPortFrom(ip, dst.Port).String())
 		if e == nil {
 			return c, nil
 		}
@@ -114,6 +139,9 @@ func (d *Outbound) ListenPacket(ctx context.Context) (outbound.PacketConn, error
 		return nil, e
 	}
 	p := &packetConn{d: d, sent: map[netip.AddrPort]struct{}{}, names: map[string]netip.Addr{}, in: make(chan datagram, inboxSize), closed: make(chan struct{})}
+	if g := d.o.Guard; g != nil {
+		p.guard = func(ip netip.Addr) bool { return g(ctx, ip) }
+	}
 	bind4 := d.o.BindIPv4
 	if !bind4.IsValid() {
 		bind4 = netip.IPv4Unspecified()
@@ -163,6 +191,7 @@ type datagram struct {
 type packetConn struct {
 	d      *Outbound
 	v4, v6 *net.UDPConn
+	guard  func(netip.Addr) bool
 
 	mu        sync.Mutex
 	sent      map[netip.AddrPort]struct{}
@@ -318,6 +347,9 @@ func (p *packetConn) WriteTo(b []byte, dst outbound.Addr) (int, error) {
 	t, e := p.target(dst)
 	if e != nil {
 		return 0, e
+	}
+	if p.guard != nil && p.guard(t.Addr()) {
+		return 0, ErrBlocked
 	}
 	s := p.v4
 	if t.Addr().Is6() {
