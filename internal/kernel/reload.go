@@ -6,12 +6,13 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
-	"reflect"
 	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/shui1iao/Kat/internal/api"
 )
 
 // ---- configuration generations ----
@@ -156,9 +157,17 @@ type plan struct {
 	sel     map[string]selRecord
 	selLog  []string
 	tls     tlsPlan
+	api     *api.Prepared
+	state   *statePlan
 }
 
 func (p *plan) abort() {
+	if p.api != nil {
+		p.api.Abort()
+	}
+	if p.state != nil {
+		p.state.abort()
+	}
 	for _, ln := range p.newTCP {
 		ln.Close()
 	}
@@ -272,6 +281,16 @@ func (k *core) prepare(c Config, prev *Server) (*Server, *plan, error) {
 		}
 		p.logger = lg
 	}
+	if prev != nil {
+		p.api, e = k.prepareAPI(&c)
+		if e != nil {
+			return fail("api", e)
+		}
+		p.state, e = k.prepareState(&c, p.sel)
+		if e != nil {
+			return fail("stats", e)
+		}
+	}
 	return g, p, nil
 }
 
@@ -290,7 +309,14 @@ func logSinkChanged(a, b *LogOptions) bool {
 }
 
 // commit installs prepared generation g. The caller holds reloadMu.
-func (k *core) commit(g *Server, p *plan) {
+func (k *core) commit(g *Server, p *plan) error {
+	// The last fallible operations happen before any generation/binding changes.
+	if p.state != nil {
+		if e := p.state.install(); e != nil {
+			return &prepareError{"stats", e}
+		}
+	}
+
 	prev := k.gen.Load()
 	g.setupStats()
 	ctx, cancel := context.WithCancel(k.ctx)
@@ -374,7 +400,9 @@ func (k *core) commit(g *Server, p *plan) {
 		for _, line := range p.selLog {
 			k.notice(levelInfo, line)
 		}
-		k.saveSelections()
+		if p.state == nil {
+			k.saveSelections()
+		}
 	}
 
 	for _, e := range removed {
@@ -416,6 +444,7 @@ func (k *core) commit(g *Server, p *plan) {
 	if prev != nil {
 		prev.supersede()
 	}
+	return nil
 }
 
 // applyRuntime switches the process-wide settings to those of g.
@@ -435,11 +464,15 @@ func (k *core) applyRuntime(prev, g *Server, p *plan) {
 	}
 	k.detailsOn.Store(g.cfg.connectionDetails())
 	k.saveInterval.Store(int64(g.cfg.statsSaveInterval()))
-	k.switchState(&g.cfg)
-	k.guard.configure(&g.cfg)
-	if !reflect.DeepEqual(apiOptionsOf(&prev.cfg), apiOptionsOf(&g.cfg)) {
-		go k.restartAPI(&g.cfg)
+	if p.state != nil {
+		p.state.commit()
 	}
+	if p.api != nil {
+		k.apiMu.Lock()
+		k.api.srv = p.api.Commit()
+		k.apiMu.Unlock()
+	}
+	k.guard.configure(&g.cfg)
 }
 
 func configuredLevel(o *LogOptions) logLevel {
@@ -540,6 +573,14 @@ func (s *Server) reload(trigger string, reread bool) (ReloadResult, error) {
 		return failWith("validate", e)
 	}
 	g, p, e := k.prepare(c, prev)
+	if e == nil {
+		e = k.commit(g, p)
+		if e != nil {
+			p.abort()
+			g.rt.close()
+			g.dns.close()
+		}
+	}
 	if e != nil {
 		// The discarded generation does not consume a number (reloadMu is
 		// held, so no other prepare runs): generations count installed
@@ -553,7 +594,6 @@ func (s *Server) reload(trigger string, reread bool) (ReloadResult, error) {
 		}
 		return failWith(stage, e)
 	}
-	k.commit(g, p)
 	k.installProviders(prov)
 	res.OK, res.Generation, res.DurationMS = true, g.id, time.Since(start).Milliseconds()
 	k.reloads.Add(1)

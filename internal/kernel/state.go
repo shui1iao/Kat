@@ -76,51 +76,6 @@ func (k *core) loadStats(c *Config) {
 	}
 }
 
-// switchState follows a reload that changed stats.file or stats.persist.
-// Counters are kept in memory; they are saved to the new file, never loaded
-// from it (that would count bytes twice).
-func (k *core) switchState(c *Config) {
-	want := ""
-	if c.Stats != nil {
-		want = c.Stats.File
-	}
-	k.statsMu.Lock()
-	cur := k.lockedFile
-	k.statsMu.Unlock()
-	if want != cur {
-		k.saveStats()
-		k.saveSelections()
-		k.statsMu.Lock()
-		if k.statsRelease != nil {
-			k.statsRelease()
-		}
-		k.statsRelease, k.lockedFile, k.selPath, k.statsPath = nil, "", "", ""
-		k.statsMu.Unlock()
-		if want != "" {
-			release, e := stats.Lock(want)
-			if e != nil {
-				reason := "lock_failed"
-				if errors.Is(e, stats.ErrLocked) {
-					reason = "file_in_use"
-				}
-				k.notice(levelWarn, "kat event=stats_persist_disabled reason="+reason+" file="+eventToken(want, 256))
-			} else {
-				k.statsMu.Lock()
-				k.statsRelease, k.lockedFile, k.selPath = release, want, selectStatePath(want)
-				k.statsMu.Unlock()
-				k.saveSelections()
-			}
-		}
-	}
-	k.statsMu.Lock()
-	if c.persistStats() && k.lockedFile == want && want != "" {
-		k.statsPath = want
-	} else {
-		k.statsPath = ""
-	}
-	k.statsMu.Unlock()
-}
-
 func (k *core) releaseStatsLock() {
 	k.statsMu.Lock()
 	defer k.statsMu.Unlock()
@@ -161,6 +116,11 @@ func (k *core) startStats(c *Config) {
 func (k *core) saveStats() error {
 	k.saveMu.Lock()
 	defer k.saveMu.Unlock()
+	return k.saveStatsLocked()
+}
+
+// Caller holds saveMu; state paths cannot change until the write completes.
+func (k *core) saveStatsLocked() error {
 	k.statsMu.Lock()
 	path := k.statsPath
 	k.statsMu.Unlock()
@@ -267,6 +227,12 @@ func (k *core) loadSelections() {
 }
 
 func (k *core) saveSelections() error {
+	k.saveMu.Lock()
+	defer k.saveMu.Unlock()
+	return k.saveSelectionsLocked()
+}
+
+func (k *core) saveSelectionsLocked() error {
 	k.statsMu.Lock()
 	path := k.selPath
 	k.statsMu.Unlock()

@@ -8,13 +8,13 @@ import (
 	"io"
 	"net"
 	"reflect"
-	"runtime"
 	"sync/atomic"
 	"time"
 )
 
 type AnyTLSOptions struct {
 	Password       string   `json:"password"`
+	PaddingScheme  string   `json:"padding_scheme,omitempty"`
 	MaxSessions    int      `json:"max_sessions,omitempty"`
 	MaxStreams     int      `json:"max_streams,omitempty"` // all sessions for this identity
 	SessionStreams int      `json:"session_streams,omitempty"`
@@ -45,6 +45,14 @@ const (
 func (o *AnyTLSOptions) normalize(connections int) error {
 	if o == nil || len(o.Password) == 0 || len(o.Password) > 4096 {
 		return errors.New("AnyTLS requires single password")
+	}
+	if o.PaddingScheme == "" {
+		o.PaddingScheme = A.DefaultPaddingScheme
+	}
+	// The kernel uses the codec's default MaxSettings (4096 bytes). Validate
+	// here as well as in NewServer so check and run accept the same schemes.
+	if err := A.ValidatePaddingScheme(o.PaddingScheme, 4096); err != nil {
+		return errors.New("invalid AnyTLS padding scheme (maximum 4096 bytes)")
 	}
 	defs := []struct {
 		p      *int
@@ -80,9 +88,11 @@ func (s *Server) prepareAnyTLS(prev *Server) error {
 		codec *A.Server
 	}
 	var prevs []anyPrev
+	previousAuth := map[string]anyTLSPreviousAuthority{}
 	if prev != nil {
-		for _, in := range prev.cfg.Inbounds {
+		for i, in := range prev.cfg.Inbounds {
 			if in.anytlsServer != nil {
+				previousAuth[listenerSlot(prev.cfg.Inbounds, i)] = anyTLSPreviousAuthority{sha256.Sum256([]byte(in.AnyTLS.Password)), in.anytlsAuth}
 				prevs = append(prevs, anyPrev{in.anytlsConf, in.anytlsServer})
 			}
 		}
@@ -94,11 +104,16 @@ func (s *Server) prepareAnyTLS(prev *Server) error {
 		}
 		o := in.AnyTLS
 		id := sha256.Sum256([]byte(o.Password))
+		slot := listenerSlot(s.cfg.Inbounds, i)
+		in.anytlsAuth = &anyTLSAuthority{slot: slot}
+		if p, ok := previousAuth[slot]; ok && p.identity == id && p.authority != nil {
+			in.anytlsAuth = p.authority
+		}
 		if old, ok := options[id]; ok && old != *o {
-			return errors.New("same AnyTLS identity must share budgets")
+			return errors.New("same AnyTLS identity must share budgets and padding scheme")
 		}
 		codec := codecs[id]
-		conf := A.Config{Password: o.Password, MaxSessions: o.MaxSessions, MaxTotalStreams: o.MaxStreams, MaxStreams: o.SessionStreams, StreamInboundBytes: o.StreamBytes, StreamOutboundBytes: o.StreamBytes, SessionInboundBytes: o.SessionBytes, SessionOutboundBytes: o.SessionBytes, HandshakeTimeout: s.cfg.Limits.HandshakeTimeout.value(), TargetTimeout: s.cfg.Limits.HandshakeTimeout.value(), SlowConsumerTimeout: o.SlowTimeout.value(), WriteTimeout: o.SlowTimeout.value()}
+		conf := A.Config{Password: o.Password, PaddingScheme: o.PaddingScheme, MaxSessions: o.MaxSessions, MaxTotalStreams: o.MaxStreams, MaxStreams: o.SessionStreams, StreamInboundBytes: o.StreamBytes, StreamOutboundBytes: o.StreamBytes, SessionInboundBytes: o.SessionBytes, SessionOutboundBytes: o.SessionBytes, HandshakeTimeout: s.cfg.Limits.HandshakeTimeout.value(), TargetTimeout: s.cfg.Limits.HandshakeTimeout.value(), SlowConsumerTimeout: o.SlowTimeout.value(), WriteTimeout: o.SlowTimeout.value()}
 		if codec == nil {
 			for _, p := range prevs {
 				if reflect.DeepEqual(p.conf, conf) {
@@ -139,14 +154,14 @@ func (c *anyStream) SetWriteDeadline(t time.Time) error { return c.st.SetWriteDe
 func (s *Server) serveAnyTLS(parent context.Context, c net.Conn, in Inbound) {
 	acc := s
 	e := in.anytlsServer.Serve(parent, c, func(ctx context.Context, st *A.Stream, r A.Request) {
-		// Each stream is a new proxied connection: it is routed by the current
-		// configuration even when its session was accepted by an older one.
-		// The current generation cannot be released while it is current, so
-		// the loop ends as soon as a reload in progress has been installed.
-		s := acc.current()
-		for s.core != nil && !s.tryRef() {
-			runtime.Gosched()
-			s = acc.current()
+		// Authorization and the routing-generation reference are committed
+		// together with the listener binding, before routing or relay I/O. A carrier
+		// accepted/authenticated before a reload cannot use a revoked binding.
+		s := acc.refAnyTLS(in.anytlsAuth)
+		if s == nil {
+			acc.counters.Rejected.Add(1)
+			st.Close() // FIN only this stream; established flows keep running
+			return
 		}
 		if s != acc {
 			ctx = acc.withInboundStat(ctx)

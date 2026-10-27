@@ -10,15 +10,18 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -64,76 +67,243 @@ type Options struct {
 	Debug func(method, path string, status int)
 }
 
-// Server is a running management interface.
+// Server owns active endpoints and every asynchronously draining predecessor.
+// A retained endpoint loads its handler for EACH request, not per connection.
 type Server struct {
-	servers []*http.Server
-	lns     []net.Listener
-	wg      sync.WaitGroup
-	once    sync.Once
+	mu        sync.Mutex
+	endpoints []*endpoint
+	draining  map[*endpoint]bool
+	closed    bool
+}
+type handlerSlot struct{ h http.Handler }
+type endpoint struct {
+	key     string
+	ln      net.Listener
+	srv     *http.Server
+	handler atomic.Pointer[handlerSlot]
+	done    chan struct{}
 }
 
-// ErrSocketInUse: another live process serves the socket path.
 var ErrSocketInUse = errors.New("api: socket path is served by another process")
-
-// ErrNotSocket: the socket path exists and is not a socket; it is never removed.
 var ErrNotSocket = errors.New("api: socket path exists and is not a socket")
 
-// Start opens the configured listeners. A listener that cannot be opened is
-// reported in errs (by "unix"/"tcp") while the others still run.
+// Prepared owns bound, but not yet accepting, candidate endpoints.
+// It is used only by the kernel's serialized reload transaction.
+type Prepared struct {
+	owner              *Server
+	endpoints, created []*endpoint
+	handlers           map[*endpoint]http.Handler
+	dirs               []string
+}
+
+func endpointKey(kind, address string) string {
+	if kind == "unix" {
+		address = filepath.Clean(address)
+	} else if a, e := netip.ParseAddrPort(address); e == nil {
+		address = netip.AddrPortFrom(a.Addr().Unmap(), a.Port()).String()
+	}
+	return kind + ":" + address
+}
+
+func newEndpoint(kind, address string, strict bool) (*endpoint, error) {
+	var ln net.Listener
+	var e error
+	if kind == "unix" {
+		if strict {
+			// Unlike startup, a failed reload must not remove even a stale foreign socket.
+			if fi, err := os.Lstat(address); err == nil {
+				if fi.Mode()&os.ModeSocket == 0 {
+					return nil, ErrNotSocket
+				}
+				return nil, ErrSocketInUse
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return nil, err
+			}
+		}
+		ln, e = listenUnix(address)
+	} else {
+		ln, e = net.Listen("tcp", address)
+	}
+	if e != nil {
+		return nil, e
+	}
+	ep := &endpoint{key: endpointKey(kind, address), ln: ln, done: make(chan struct{})}
+	ep.srv = &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { ep.handler.Load().h.ServeHTTP(w, r) }), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10, ErrorLog: log.New(io.Discard, "", 0)}
+	return ep, nil
+}
+func (e *endpoint) start() { go func() { defer close(e.done); _ = e.srv.Serve(e.ln) }() }
+func (e *endpoint) shutdown() {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if e.srv.Shutdown(ctx) != nil {
+		_ = e.srv.Close()
+	}
+	<-e.done
+}
+
+// Start retains the historical best-effort startup behavior.
 func Start(o Options, b Backend) (*Server, map[string]error) {
-	s := &Server{}
+	s := &Server{draining: map[*endpoint]bool{}}
 	errs := map[string]error{}
 	h := handler(b, o.Debug)
-	if o.Socket != "" {
-		if ln, e := listenUnix(o.Socket); e != nil {
-			errs["unix"] = e
-		} else {
-			s.serve(ln, h)
+	for _, v := range []struct{ kind, address string }{{"unix", o.Socket}, {"tcp", o.Listen}} {
+		if v.address == "" {
+			continue
 		}
-	}
-	if o.Listen != "" {
-		if ln, e := net.Listen("tcp", o.Listen); e != nil {
-			errs["tcp"] = e
-		} else {
-			s.serve(ln, requireBearer(o.Secret, h))
+		e, err := newEndpoint(v.kind, v.address, false)
+		if err != nil {
+			errs[v.kind] = err
+			continue
 		}
+		eh := h
+		if v.kind == "tcp" {
+			eh = requireBearer(o.Secret, h)
+		}
+		e.handler.Store(&handlerSlot{eh})
+		s.endpoints = append(s.endpoints, e)
+		e.start()
 	}
 	return s, errs
 }
 
-// Addrs returns the listening addresses (for tests and logs).
+// Prepare reuses stable listeners and binds every new one without serving.
+// Any failure closes ALL candidates. The running handlers stay untouched.
+func Prepare(o Options, b Backend, s *Server) (*Prepared, error) {
+	if s == nil {
+		s = &Server{draining: map[*endpoint]bool{}}
+	}
+	s.mu.Lock()
+	oldEndpoints := append([]*endpoint(nil), s.endpoints...)
+	closed := s.closed
+	s.mu.Unlock()
+	if closed {
+		return nil, errors.New("api: server is closed")
+	}
+	p := &Prepared{owner: s, handlers: map[*endpoint]http.Handler{}}
+	h := handler(b, o.Debug)
+	for _, v := range []struct{ kind, address string }{{"unix", o.Socket}, {"tcp", o.Listen}} {
+		if v.address == "" {
+			continue
+		}
+		var ep *endpoint
+		for _, old := range oldEndpoints {
+			if old.key == endpointKey(v.kind, v.address) {
+				ep = old
+				break
+			}
+		}
+		if ep == nil {
+			if v.kind == "unix" {
+				// Remember only absent parents; abort removes them only if still empty.
+				for d := filepath.Dir(v.address); d != "." && d != "/"; d = filepath.Dir(d) {
+					if _, err := os.Lstat(d); err == nil {
+						break
+					} else if !errors.Is(err, os.ErrNotExist) {
+						break
+					}
+					p.dirs = append(p.dirs, d)
+				}
+			}
+			var err error
+			ep, err = newEndpoint(v.kind, v.address, true)
+			if err != nil {
+				p.Abort()
+				return nil, fmt.Errorf("%s listener: %w", v.kind, err)
+			}
+			p.created = append(p.created, ep)
+		}
+		eh := h
+		if v.kind == "tcp" {
+			eh = requireBearer(o.Secret, h)
+		}
+		p.endpoints = append(p.endpoints, ep)
+		p.handlers[ep] = eh
+	}
+	return p, nil
+}
+func (p *Prepared) Abort() {
+	if p == nil {
+		return
+	}
+	for _, e := range p.created {
+		_ = e.ln.Close()
+	}
+	for _, d := range p.dirs {
+		_ = os.Remove(d)
+	}
+	p.created = nil
+	p.dirs = nil
+}
+
+// Commit cannot fail. Removed listeners close immediately; Shutdown must NOT
+// run synchronously in the goroutine answering POST /v1/reload.
+func (p *Prepared) Commit() *Server {
+	s := p.owner
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	keep := map[*endpoint]bool{}
+	for _, e := range p.endpoints {
+		keep[e] = true
+		e.handler.Store(&handlerSlot{p.handlers[e]})
+	}
+	for _, e := range s.endpoints {
+		if !keep[e] {
+			// A request already admitted may finish. A new request on an old keepalive
+			// connection cannot retain the old secret or execute management actions.
+			e.handler.Store(&handlerSlot{http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				writeError(w, http.StatusServiceUnavailable, "api_retired", "management endpoint retired")
+			})})
+			_ = e.ln.Close()
+			e.srv.SetKeepAlivesEnabled(false)
+			s.draining[e] = true
+			go func(e *endpoint) { e.shutdown(); s.mu.Lock(); delete(s.draining, e); s.mu.Unlock() }(e)
+		}
+	}
+	s.endpoints = p.endpoints
+	for _, e := range p.created {
+		e.start()
+	}
+	p.created = nil
+	p.dirs = nil
+	return s
+}
 func (s *Server) Addrs() []net.Addr {
-	out := make([]net.Addr, len(s.lns))
-	for i, l := range s.lns {
-		out[i] = l.Addr()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]net.Addr, len(s.endpoints))
+	for i, e := range s.endpoints {
+		out[i] = e.ln.Addr()
 	}
 	return out
 }
-
-func (s *Server) serve(ln net.Listener, h http.Handler) {
-	srv := &http.Server{Handler: h, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10, ErrorLog: log.New(io.Discard, "", 0)}
-	s.servers = append(s.servers, srv)
-	s.lns = append(s.lns, ln)
-	s.wg.Add(1)
-	go func() { defer s.wg.Done(); _ = srv.Serve(ln) }()
-}
-
-// Close stops all listeners (removing the socket file) and waits briefly for
-// in-flight requests.
 func (s *Server) Close() {
 	if s == nil {
 		return
 	}
-	s.once.Do(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		for _, srv := range s.servers {
-			if srv.Shutdown(ctx) != nil {
-				srv.Close()
-			}
-		}
-		s.wg.Wait()
-	})
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+	s.closed = true
+	all := map[*endpoint]bool{}
+	for _, e := range s.endpoints {
+		all[e] = true
+	}
+	for e := range s.draining {
+		all[e] = true
+	}
+	for e := range all {
+		_ = e.ln.Close()
+		e.srv.SetKeepAlivesEnabled(false)
+	}
+	s.mu.Unlock()
+	var wg sync.WaitGroup
+	for e := range all {
+		wg.Add(1)
+		go func(e *endpoint) { defer wg.Done(); e.shutdown() }(e)
+	}
+	wg.Wait()
 }
 
 func listenUnix(path string) (net.Listener, error) {
@@ -163,7 +333,34 @@ func listenUnix(path string) (net.Listener, error) {
 		ln.Close()
 		return nil, e
 	}
-	return peerCheckListener(ln), nil
+	// Disable net.UnixListener's unconditional unlink-on-close. Ownership is
+	// checked by inode so a draining predecessor cannot remove its replacement.
+	if u, ok := ln.(*net.UnixListener); ok {
+		u.SetUnlinkOnClose(false)
+	}
+	fi, e := os.Lstat(path)
+	if e != nil {
+		ln.Close()
+		return nil, e
+	}
+	return peerCheckListener(&ownedUnixListener{Listener: ln, path: path, info: fi}), nil
+}
+
+type ownedUnixListener struct {
+	net.Listener
+	path string
+	info os.FileInfo
+	once sync.Once
+}
+
+func (l *ownedUnixListener) Close() error {
+	e := l.Listener.Close()
+	l.once.Do(func() {
+		if fi, err := os.Lstat(l.path); err == nil && os.SameFile(fi, l.info) {
+			_ = os.Remove(l.path)
+		}
+	})
+	return e
 }
 
 func requireBearer(secret string, next http.Handler) http.Handler {

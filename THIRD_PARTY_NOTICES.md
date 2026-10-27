@@ -24,7 +24,7 @@ Kat 自研代码保留所有权利；下述第三方组件及其修改继续适�
 
 ## 随二进制提供
 
-`kat-0.7.0-third-party-licenses.txt` 附件汇总本说明、MPL 修改说明、第三方许可原文及其目录路径。对应受许可源码与差异可从 `https://github.com/shui1iao/Kat/tree/v0.7.0` 获取；分发者应保持此获取路径及对应版本源码可用，同时履行各原许可的其他适用义务。原始法律文本不翻译或改写。
+`kat-0.7.1-third-party-licenses.txt` 附件汇总本说明、MPL 修改说明、第三方许可原文及其目录路径。对应受许可源码与差异可从 `https://github.com/shui1iao/Kat/tree/v0.7.1` 获取；分发者应保持此获取路径及对应版本源码可用，同时履行各原许可的其他适用义务。原始法律文本不翻译或改写。
 
 ## maxminddb-golang
 

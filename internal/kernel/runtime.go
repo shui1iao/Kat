@@ -85,20 +85,15 @@ func (k *core) startAPI(c *Config) {
 	}
 }
 
-// restartAPI applies changed api options after a reload. It runs on its own
-// goroutine: the old interface finishes in-flight requests (including the
-// reload request itself) before it is closed.
-func (k *core) restartAPI(c *Config) {
-	k.apiMu.Lock()
-	defer k.apiMu.Unlock()
-	k.mu.Lock()
-	closing := k.closing
-	k.mu.Unlock()
-	if closing {
-		return
+// prepareAPI is reload-only. Startup deliberately remains best effort.
+func (k *core) prepareAPI(c *Config) (*api.Prepared, error) {
+	o := apiOptionsOf(c)
+	o.Debug = func(method, path string, status int) {
+		if k.log.enabled(levelDebug) {
+			k.notice(levelDebug, "kat event=api_request method="+eventToken(method, 8)+" path="+eventToken(path, 64)+" status="+strconv.Itoa(status))
+		}
 	}
-	k.api.close()
-	k.startAPI(c)
+	return api.Prepare(o, apiBackend{k}, k.api.srv)
 }
 
 // ---- management backend ----
@@ -162,9 +157,11 @@ func (s *core) statsView() StatsView {
 func (b apiBackend) Version() string { return Version }
 func (b apiBackend) Stats() any      { return b.k.statsView() }
 func (b apiBackend) ResetStats() error {
+	b.k.saveMu.Lock()
+	defer b.k.saveMu.Unlock()
 	b.k.reg.Reset(time.Now())
 	b.k.notice(levelInfo, "kat event=stats_reset")
-	return b.k.saveStats()
+	return b.k.saveStatsLocked()
 }
 func (b apiBackend) Connections() (any, bool) {
 	if !b.k.detailsOn.Load() {

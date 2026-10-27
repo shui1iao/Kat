@@ -67,7 +67,7 @@ type core struct {
 	flows        map[uint64]*flow
 	tcpFlows     atomic.Int64
 	api          *apiState
-	apiMu        sync.Mutex // serializes API restarts
+	apiMu        sync.Mutex // serializes API ownership changes
 	statsMu      sync.Mutex // guards statsPath/statsRelease/lockedFile/selPath
 	statsPath    string     // persisted statistics file ("" = not persisted)
 	lockedFile   string     // statistics file whose instance lock is held
@@ -228,9 +228,9 @@ func Start(c Config) (*Server, error) {
 	k.installProviders(prov)
 	k.providerWG.Add(1)
 	go func() { defer k.providerWG.Done(); k.rebuildLoop() }()
-	k.reloadMu.Unlock()
 	k.startStats(&c)
 	k.startAPI(&c)
+	k.reloadMu.Unlock()
 	return s, nil
 }
 

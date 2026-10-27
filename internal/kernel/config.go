@@ -63,6 +63,7 @@ type Inbound struct {
 	Reality       *RealityOptions    `json:"reality,omitempty"`
 	realityServer *VX.RealityServer
 	AnyTLS        *AnyTLSOptions `json:"anytls,omitempty"`
+	anytlsAuth    *anyTLSAuthority
 	anytlsServer  *A.Server
 	Protocol      string        `json:"protocol"`
 	Listen        string        `json:"listen"`
@@ -480,7 +481,7 @@ func (c *Config) Validate() error {
 	for _, in := range c.Inbounds {
 		if in.AnyTLS != nil {
 			if old, ok := seenAny[in.AnyTLS.Password]; ok && old != *in.AnyTLS {
-				return errors.New("same AnyTLS identity has conflicting limits")
+				return errors.New("same AnyTLS identity has conflicting limits or padding scheme")
 			}
 			seenAny[in.AnyTLS.Password] = *in.AnyTLS
 		}

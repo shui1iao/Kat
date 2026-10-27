@@ -111,7 +111,7 @@ func NewServer(c Config) (*Server, error) {
 	if c.PaddingScheme == "" {
 		c.PaddingScheme = DefaultPaddingScheme
 	}
-	if err := validatePadding(c.PaddingScheme, c.MaxSettings); err != nil {
+	if err := ValidatePaddingScheme(c.PaddingScheme, c.MaxSettings); err != nil {
 		return nil, err
 	}
 	fingerprint := md5.Sum([]byte(c.PaddingScheme))
@@ -119,7 +119,10 @@ func NewServer(c Config) (*Server, error) {
 	s.cfg.Password = ""
 	return s, nil
 }
-func validatePadding(s string, limit int) error {
+
+// ValidatePaddingScheme checks the wire scheme syntax and its byte limit.
+// Callers must resolve an empty scheme to DefaultPaddingScheme first.
+func ValidatePaddingScheme(s string, limit int) error {
 	if len(s) > limit || !utf8.ValidString(s) {
 		return ErrConfig
 	}
